@@ -108,3 +108,15 @@ jobs:
           path: target/packages/*-portable.exe
           archive: false
           if-no-files-found: error
+
+      # And the Microsoft Store package (unsigned: the Store signs it).
+      - name: Package the Microsoft Store MSIX
+        if: runner.os == 'Windows'
+        shell: bash
+        run: scripts/package-msix.sh
+      - uses: actions/upload-artifact@v7
+        if: runner.os == 'Windows'
+        with:
+          path: target/packages/*.msix
+          archive: false
+          if-no-files-found: error

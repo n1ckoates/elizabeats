@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The Microsoft Store (MSIX) package's manifest; scripts/package-msix.sh packs
+  it with elizabeats.exe and Assets/. Identity comes from Partner Center
+  (Product management > Product identity) and must never change, or it's a
+  different Store app:
+    Package family name: NickOates.Elizabeats_hv76jwa7643gm
+    Store ID: 9N2ZWRW8H344
+  Version is filled in from Cargo.toml when packing.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap rescap">
+
+  <Identity
+    Name="NickOates.Elizabeats"
+    Publisher="CN=6FD72A19-AB20-4486-BE13-1615F28B73F2"
+    Version="0.0.0.0"
+    ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>Elizabeats</DisplayName>
+    <PublisherDisplayName>Nick Oates</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+    <!-- The Visual C++ runtime (vcruntime140.dll); the Store installs it with the app. -->
+    <PackageDependency
+      Name="Microsoft.VCLibs.140.00.UWPDesktop"
+      MinVersion="14.0.24217.0"
+      Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <!-- A regular desktop app (not sandboxed): it reads the Library folder,
+         starts its BotGuard helper process and uses WebView2. -->
+    <Application Id="Elizabeats" Executable="elizabeats.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="Elizabeats"
+        Description="DJ-operated radio playout"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png" />
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <Capability Name="internetClient" />
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>
