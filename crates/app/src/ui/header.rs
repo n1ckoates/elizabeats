@@ -5,10 +5,12 @@ use elizabeats_core::format::format_duration;
 use elizabeats_core::queue::{ItemKind, Queue};
 use elizabeats_core::session::Session;
 use elizabeats_core::timing::{KnownDuration, estimate_until_next_break, queued_track_duration};
+use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::{ActiveTheme, StyledExt, TitleBar, h_flex};
 use gpui_kit::{
     Context, Decorations, InteractiveElement, IntoElement, ParentElement, Pixels, Point,
-    SharedString, Styled, Window, div, point, px,
+    SharedString, Styled, Window, div, point, prelude::FluentBuilder, px,
 };
 
 use super::{AppView, tabular};
@@ -184,12 +186,24 @@ impl AppView {
                     .child(metric(metrics.boundary_value, metrics.boundary_label, cx)),
             )
             .child(
-                div()
+                h_flex()
+                    .gap_2()
                     .pr(px(settings_button_padding(window)))
                     // On Windows the header is a native drag region, and
                     // Windows treats a click anywhere in it as the start of a
                     // window drag unless something occludes it there.
                     .occlude()
+                    .when(self.updates.read(cx).is_ready(), |buttons| {
+                        buttons.child(
+                            Button::new("restart-to-update")
+                                .primary()
+                                .icon(Lucide::RotateCw)
+                                .label("Restart to Update")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.restart_to_update(window, cx)
+                                })),
+                        )
+                    })
                     .child(self.render_settings_button(window, cx)),
             )
     }

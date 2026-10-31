@@ -23,10 +23,12 @@ use super::{APP_CONTEXT, FocusSearch, InsertBreak, Minimize, Quit, SkipActive, Z
 use crate::artwork::ArtworkCache;
 use crate::search::Search;
 use crate::station::{Station, StationParts};
+use crate::updates::Updates;
 
 pub struct AppView {
     pub(super) station: Entity<Station>,
     pub(super) search: Entity<Search>,
+    pub(super) updates: Entity<Updates>,
     pub(super) artwork: Entity<ArtworkCache>,
     pub(super) split: Entity<ResizableState>,
     pub(super) search_input: Entity<InputState>,
@@ -55,6 +57,12 @@ pub struct AppView {
     _subscriptions: Vec<Subscription>,
 }
 
+#[derive(Clone, Copy)]
+enum CloseReason {
+    Close,
+    RestartToUpdate,
+}
+
 impl AppView {
     pub fn new(parts: StationParts, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let services = parts.services.clone();
@@ -63,7 +71,10 @@ impl AppView {
         let artwork = cx.new(|_| ArtworkCache::new(services));
         let split = cx.new(|_| ResizableState::default());
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search..."));
-        let settings_view = cx.new(|cx| SettingsView::new(station.clone(), window, cx));
+        let updates = cx.new(Updates::new);
+        let app_view = cx.entity().downgrade();
+        let settings_view =
+            cx.new(|cx| SettingsView::new(station.clone(), updates.clone(), app_view, window, cx));
         let log_dates: Arc<RwLock<HashSet<NaiveDate>>> = Arc::default();
         let matcher_dates = log_dates.clone();
         let log_date_picker = cx.new(|cx| {
@@ -91,6 +102,7 @@ impl AppView {
                 cx.notify();
             }),
             cx.observe(&search, |_, _, cx| cx.notify()),
+            cx.observe(&updates, |_, _, cx| cx.notify()),
             cx.observe(&artwork, |_, _, cx| cx.notify()),
             cx.subscribe_in(
                 &search_input,
@@ -144,13 +156,16 @@ impl AppView {
 
         let view = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
-            view.update(cx, |this, cx| this.request_close(window, cx))
-                .unwrap_or(true)
+            view.update(cx, |this, cx| {
+                this.request_close(CloseReason::Close, window, cx)
+            })
+            .unwrap_or(true)
         });
 
         let mut this = Self {
             station,
             search,
+            updates,
             artwork,
             split,
             search_input,
@@ -273,8 +288,15 @@ impl AppView {
 
     // ---- Closing -----------------------------------------------------------
 
-    /// Window close / Cmd+Q. Returns whether the window may close right now.
-    fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    /// Window close / Cmd+Q, or restarting into a downloaded update. Returns
+    /// whether the window may close right now; while something plays, it
+    /// asks first.
+    fn request_close(
+        &mut self,
+        reason: CloseReason,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if !self.station.read(cx).needs_close_confirmation() {
             self.station.update(cx, |station, _| station.shutdown());
             return true;
@@ -283,18 +305,28 @@ impl AppView {
             return false;
         }
         self.close_prompt_open = true;
+        let (title, description, ok_text) = match reason {
+            CloseReason::Close => (
+                "Close Elizabeats?",
+                "Closing will stop the audio and save this queue as a cleanly closed session.",
+                "Close and Stop Playback",
+            ),
+            CloseReason::RestartToUpdate => (
+                "Restart to update?",
+                "Restarting will stop the audio and save this queue. Elizabeats reopens with the update installed.",
+                "Restart and Stop Playback",
+            ),
+        };
         let view = cx.entity().downgrade();
         let cancel_view = view.clone();
         window.open_alert_dialog(cx, move |alert: AlertDialog, _, _| {
             let view = view.clone();
             let cancel_view = cancel_view.clone();
             alert
-                .title("Close Elizabeats?")
-                .description(
-                    "Closing will stop the audio and save this queue as a cleanly closed session.",
-                )
+                .title(title)
+                .description(description)
                 .confirm()
-                .ok_text("Close and Stop Playback")
+                .ok_text(ok_text)
                 .cancel_text("Cancel")
                 .on_ok(move |_, window, cx| {
                     let _ = view.update(cx, |this, cx| {
@@ -305,17 +337,32 @@ impl AppView {
                     true
                 })
                 .on_cancel(move |_, _, cx| {
-                    let _ = cancel_view.update(cx, |this, _| this.close_prompt_open = false);
+                    let _ = cancel_view.update(cx, |this, cx| {
+                        this.close_prompt_open = false;
+                        this.updates
+                            .update(cx, |updates, _| updates.set_restart_after_quit(false));
+                    });
                     true
                 })
         });
         false
     }
 
+    /// "Restart to Update": quits like closing the window (asking first while
+    /// something plays); the update installs once the app has quit, and the
+    /// app reopens.
+    pub(super) fn restart_to_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.updates
+            .update(cx, |updates, _| updates.set_restart_after_quit(true));
+        if self.request_close(CloseReason::RestartToUpdate, window, cx) {
+            window.remove_window();
+        }
+    }
+
     // ---- Actions -----------------------------------------------------------
 
     fn on_quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
-        if self.request_close(window, cx) {
+        if self.request_close(CloseReason::Close, window, cx) {
             window.remove_window();
         }
     }

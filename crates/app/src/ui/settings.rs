@@ -1,10 +1,11 @@
 //! Settings, built on GPUI Kit's Settings component: a sidebar of pages
-//! (Library, Playback, Storage, Appearance), each with grouped items.
+//! (Library, Playback, Storage, Appearance, About), each with grouped items.
 
 use std::path::PathBuf;
 
 use elizabeats_core::format::format_bytes;
 use elizabeats_core::{AppSettings, Theme};
+use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_kit::component::dialog::{AlertDialog, Dialog};
 use gpui_kit::component::setting::{
@@ -18,6 +19,7 @@ use gpui_kit::{
 
 use super::AppView;
 use crate::station::Station;
+use crate::updates::{REPOSITORY_URL, UpdateStatus, Updates, VERSION_LABEL, WEBSITE_URL};
 
 #[derive(Default)]
 struct Errors {
@@ -28,6 +30,8 @@ struct Errors {
 
 pub struct SettingsView {
     station: Entity<Station>,
+    updates: Entity<Updates>,
+    app_view: WeakEntity<AppView>,
     busy: bool,
     errors: Errors,
     _subscriptions: Vec<Subscription>,
@@ -56,10 +60,21 @@ fn theme_value(theme: Theme) -> SharedString {
 }
 
 impl SettingsView {
-    pub fn new(station: Entity<Station>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        station: Entity<Station>,
+        updates: Entity<Updates>,
+        app_view: WeakEntity<AppView>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
-            _subscriptions: vec![cx.observe(&station, |_, _, cx| cx.notify())],
+            _subscriptions: vec![
+                cx.observe(&station, |_, _, cx| cx.notify()),
+                cx.observe(&updates, |_, _, cx| cx.notify()),
+            ],
             station,
+            updates,
+            app_view,
             busy: false,
             errors: Errors::default(),
         }
@@ -480,9 +495,107 @@ impl Render for SettingsView {
                 .items(error_item(self.errors.settings.clone())),
         );
 
+        let about = self.render_about(cx);
+
         div()
             .size_full()
-            .child(Settings::new("settings").pages([library, playback, storage, appearance]))
+            .child(Settings::new("settings").pages([library, playback, storage, appearance, about]))
+    }
+}
+
+impl SettingsView {
+    fn render_about(&self, cx: &App) -> SettingPage {
+        let status = self.updates.read(cx).status().clone();
+        let status_text: SharedString = match &status {
+            UpdateStatus::DevBuild => "Updates are off in development builds.".into(),
+            UpdateStatus::NotInstalled => {
+                "This copy doesn't update itself. The Microsoft Store version updates through the Store."
+                    .into()
+            }
+            UpdateStatus::Idle => "Elizabeats checks for updates automatically.".into(),
+            UpdateStatus::Checking => "Checking for updates…".into(),
+            UpdateStatus::UpToDate => "Elizabeats is up to date.".into(),
+            UpdateStatus::Downloading { version } => format!("Downloading version {version}…").into(),
+            UpdateStatus::Ready { version } => {
+                format!("Version {version} is ready. It installs when you quit Elizabeats.").into()
+            }
+            UpdateStatus::Failed(error) => format!("Couldn't check for updates: {error}").into(),
+        };
+        let ready = matches!(status, UpdateStatus::Ready { .. });
+        let can_check = matches!(
+            status,
+            UpdateStatus::Idle | UpdateStatus::UpToDate | UpdateStatus::Failed(_)
+        );
+        let updates = self.updates.clone();
+        let app_view = self.app_view.clone();
+
+        let link = |id: &'static str, label: &'static str, icon: Lucide, url: &'static str| {
+            SettingField::render(move |_, _, _| {
+                Button::new(id)
+                    .outline()
+                    .small()
+                    .icon(icon)
+                    .label(label)
+                    .on_click(move |_, _, cx| cx.open_url(url))
+            })
+        };
+
+        SettingPage::new("About")
+            .icon(Lucide::Info)
+            .group(
+                SettingGroup::new()
+                    .item(SettingItem::new(
+                        "Version",
+                        SettingField::render(|_, _, _| div().text_sm().child(VERSION_LABEL)),
+                    ))
+                    .item(
+                        SettingItem::new(
+                            "Updates",
+                            SettingField::render(move |_, _, _| {
+                                let updates = updates.clone();
+                                let app_view = app_view.clone();
+                                if ready {
+                                    Button::new("about-restart-to-update")
+                                        .primary()
+                                        .small()
+                                        .label("Restart to Update")
+                                        .on_click(move |_, window, cx| {
+                                            let _ = app_view.update(cx, |view, cx| {
+                                                view.restart_to_update(window, cx)
+                                            });
+                                        })
+                                } else {
+                                    Button::new("check-for-updates")
+                                        .outline()
+                                        .small()
+                                        .label("Check for Updates")
+                                        .disabled(!can_check)
+                                        .on_click(move |_, _, cx| {
+                                            updates.update(cx, |updates, cx| updates.check(cx));
+                                        })
+                                }
+                            }),
+                        )
+                        .description(status_text),
+                    ),
+            )
+            .group(
+                SettingGroup::new()
+                    .title("Links")
+                    .item(SettingItem::new(
+                        "Source code",
+                        link("open-github", "GitHub", Lucide::Github, REPOSITORY_URL),
+                    ))
+                    .item(SettingItem::new(
+                        "Website",
+                        link(
+                            "open-website",
+                            "elizabeats.nickoates.com",
+                            Lucide::Globe,
+                            WEBSITE_URL,
+                        ),
+                    )),
+            )
     }
 }
 

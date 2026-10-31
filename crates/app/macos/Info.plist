@@ -1,11 +1,34 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Merged into Elizabeats.app's Info.plist by cargo-packager. -->
+<!-- Elizabeats.app's Info.plist; scripts/package.sh fills in the version. -->
 <plist version="1.0">
 <dict>
-  <!-- The Icon Composer icon in Assets.car (scripts/compile-macos-icon.sh),
-       used on macOS 26+. Older macOS uses CFBundleIconFile (icon.icns). -->
+  <key>CFBundleName</key>
+  <string>Elizabeats</string>
+  <key>CFBundleDisplayName</key>
+  <string>Elizabeats</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.nickoates.elizabeats</string>
+  <key>CFBundleExecutable</key>
+  <string>elizabeats</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>$VERSION</string>
+  <key>CFBundleVersion</key>
+  <string>$VERSION</string>
+  <!-- Older macOS: the classic icon. -->
+  <key>CFBundleIconFile</key>
+  <string>icon.icns</string>
+  <!-- macOS 26+: the Icon Composer icon in Assets.car
+       (scripts/compile-macos-icon.sh). -->
   <key>CFBundleIconName</key>
   <string>icon</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>11.0</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.music</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
 </dict>
 </plist>

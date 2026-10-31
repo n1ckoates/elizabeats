@@ -1,0 +1,42 @@
+name: Checks
+
+# Formatting, lints and tests. Called by CI (every push and pull request) and
+# by the release workflow, which only publishes when these pass.
+on:
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Formatting is the same everywhere and needs no build, so it runs once.
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: rustup toolchain install
+      - run: cargo fmt --all --check
+
+  # Lints and tests run per OS: they only see code compiled for that OS.
+  check:
+    name: Check (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macOS, os: macos-latest }
+          - { name: Windows, os: windows-latest }
+          - { name: Linux, os: ubuntu-22.04 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+        with:
+          cache-key: ${{ matrix.name }}
+
+      - name: Lints
+        run: cargo lint
+      - name: Tests
+        run: cargo test --workspace

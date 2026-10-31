@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Compiles assets/icon.icon (Icon Composer) into target/macos-icon/Assets.car,
-# which cargo-packager copies into Elizabeats.app (see crates/app/Cargo.toml).
+# which scripts/package.sh copies into Elizabeats.app.
 # macOS 26+ uses it for the Liquid Glass icon, including its dark, tinted and
 # clear variants; older macOS keeps using assets/icon.icns.
 #
 # Needs Xcode 26 or newer (for `actool`); the command line tools alone aren't
-# enough. Run it before `cargo packager` on macOS.
+# enough. Run it before scripts/package.sh on macOS.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

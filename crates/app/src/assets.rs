@@ -19,7 +19,11 @@ gpui_kit::assets::icon_assets!(
         Music,
         Clock,
         GripVertical,
-        HardDrive
+        HardDrive,
+        RotateCw,
+        Info,
+        Github,
+        Globe
     ]
 );
 
