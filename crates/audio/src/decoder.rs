@@ -6,8 +6,6 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -22,7 +20,7 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 
 use crate::channels::map_channels;
-use crate::mixer::TrackShared;
+use crate::mixer::{Track, TrackKey, TrackShared};
 
 /// How long the decoder sleeps when the ring buffer is full.
 const FULL_BUFFER_WAIT: Duration = Duration::from_millis(5);
@@ -313,37 +311,33 @@ impl StreamResampler {
     }
 }
 
-/// Starts a decoder thread for `path`. It reports failure through
-/// `on_failure` (unless cancelled) and marks `shared` finished after pushing
-/// its final sample.
+/// Creates the track for `key` and starts a decoder thread filling it from
+/// `path`. The thread marks the track finished after pushing its final
+/// sample, stops early once the mixer has dropped the track, and reports
+/// failure through `on_failure`.
 pub(crate) fn spawn_decoder(
+    key: TrackKey,
     path: PathBuf,
     out_rate: u32,
     out_channels: usize,
-    producer: Producer<f32>,
-    shared: Arc<TrackShared>,
-    cancel: Arc<AtomicBool>,
     on_failure: impl FnOnce(String) + Send + 'static,
-) -> std::io::Result<JoinHandle<()>> {
-    thread::Builder::new()
+) -> std::io::Result<(Track, JoinHandle<()>)> {
+    let (track, producer, shared) = Track::new(key, out_rate, out_channels);
+    let handle = thread::Builder::new()
         .name("elizabeats-decoder".into())
         .spawn(move || {
             // Symphonia can panic on malformed streams; never let that take
             // anything else down.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                pump(&path, out_rate, out_channels, producer, &shared, &cancel)
+                pump(&path, out_rate, out_channels, producer, &shared)
             }));
-            let failure = match result {
-                Ok(Ok(())) => None,
-                Ok(Err(message)) => Some(message),
-                Err(_) => Some("The audio decoder crashed on this file.".to_string()),
-            };
-            if let Some(message) = failure
-                && !cancel.load(Ordering::Relaxed)
-            {
-                on_failure(message);
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(message)) => on_failure(message),
+                Err(_) => on_failure("The audio decoder crashed on this file.".to_string()),
             }
-        })
+        })?;
+    Ok((track, handle))
 }
 
 /// Decodes the whole file into `producer`, waiting whenever it is full.
@@ -353,18 +347,14 @@ fn pump(
     out_channels: usize,
     mut producer: Producer<f32>,
     shared: &TrackShared,
-    cancel: &AtomicBool,
 ) -> Result<(), String> {
     let mut decoder = SourceDecoder::open(path, out_rate, out_channels)?;
     shared.set_duration(decoder.duration_secs());
     let mut batch = Vec::new();
     loop {
-        if cancel.load(Ordering::Relaxed) {
-            return Ok(());
-        }
         let more = decoder.read(&mut batch)?;
-        if !push_all(&batch, out_channels, &mut producer, cancel) {
-            return Ok(()); // cancelled or the track was unloaded
+        if !push_all(&batch, out_channels, &mut producer) {
+            return Ok(()); // the track was unloaded
         }
         if !more {
             shared.mark_finished();
@@ -374,20 +364,14 @@ fn pump(
 }
 
 /// Pushes whole frames into the ring buffer, sleeping while it is full.
-/// Returns false if cancelled or the mixer dropped the track.
-fn push_all(
-    samples: &[f32],
-    channels: usize,
-    producer: &mut Producer<f32>,
-    cancel: &AtomicBool,
-) -> bool {
+/// Returns false if the mixer dropped the track.
+fn push_all(samples: &[f32], channels: usize, producer: &mut Producer<f32>) -> bool {
     let mut rest = samples;
     while !rest.is_empty() {
-        if cancel.load(Ordering::Relaxed) || producer.is_abandoned() {
+        if producer.is_abandoned() {
             return false;
         }
-        let room = producer.slots() / channels * channels;
-        let count = room.min(rest.len());
+        let count = (producer.slots() / channels * channels).min(rest.len());
         if count == 0 {
             thread::sleep(FULL_BUFFER_WAIT);
             continue;
@@ -415,17 +399,8 @@ pub(crate) mod tests {
             return;
         };
         let started = std::time::Instant::now();
-        let mut decoder = SourceDecoder::open(Path::new(&path), 48_000, 2).unwrap();
-        let mut out = Vec::new();
-        let mut samples = 0usize;
-        loop {
-            let more = decoder.read(&mut out).unwrap();
-            samples += out.len();
-            if !more {
-                break;
-            }
-        }
-        let audio_secs = samples as f64 / 2.0 / 48_000.0;
+        let (samples, _) = decode_all(Path::new(&path), 48_000, 2);
+        let audio_secs = samples.len() as f64 / 2.0 / 48_000.0;
         let took = started.elapsed().as_secs_f64();
         println!(
             "decoded {audio_secs:.0} s of audio in {took:.3} s = {:.0}x real time",

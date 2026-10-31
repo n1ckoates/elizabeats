@@ -39,19 +39,20 @@ pub fn parse_video_id(input: &str) -> Option<String> {
 
 /// True for an 11-character YouTube video ID.
 pub(crate) fn is_valid_video_id(id: &str) -> bool {
-    id.len() == 11
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    id.len() == 11 && id.bytes().all(is_id_byte)
+}
+
+/// Letters, digits, `_` and `-`: the characters of video IDs (and of the
+/// Download Cache's file names, which are named after them).
+pub(crate) fn is_id_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn parse(input: &str) -> Option<String> {
-        parse_video_id(input)
-    }
+    use parse_video_id as parse;
 
     #[test]
     fn recognizes_supported_links() {

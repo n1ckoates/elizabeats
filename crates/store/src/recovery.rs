@@ -1,55 +1,44 @@
 //! `recovery.json`: the Queue snapshot restored after an unclean shutdown.
 
-use std::io;
 use std::path::Path;
 
 use elizabeats_core::RecoverySnapshot;
 
-use crate::atomic::remove_file_durably;
-use crate::{StoreError, write_atomic};
+use crate::StoreError;
+use crate::files::{read_optional, remove_file, write_atomic};
 
-pub const RECOVERY_FILE: &str = "recovery.json";
-pub const RECOVERY_VERSION: u32 = 1;
-
-const WHAT: &str = "Queue recovery";
+const FILE: &str = "recovery.json";
+const VERSION: u32 = 1;
 
 /// `Ok(None)` when there is nothing to recover. An unreadable or invalid
 /// snapshot is an error so the UI can report it rather than silently losing
-/// the Queue.
+/// the Queue. Errors are worded to follow "Queue recovery could not be read: ".
 pub fn read_recovery(dir: &Path) -> Result<Option<RecoverySnapshot>, StoreError> {
-    let path = dir.join(RECOVERY_FILE);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(StoreError::io("read", &path, source)),
+    let Some(bytes) = read_optional(dir, FILE)? else {
+        return Ok(None);
     };
     let snapshot: RecoverySnapshot =
-        serde_json::from_slice(&bytes).map_err(|error| StoreError::Invalid {
-            what: WHAT,
-            detail: error.to_string(),
-        })?;
-    if snapshot.version != RECOVERY_VERSION {
-        return Err(StoreError::Invalid {
-            what: WHAT,
-            detail: format!("unsupported version {}", snapshot.version),
-        });
+        serde_json::from_slice(&bytes).map_err(|error| StoreError::Invalid(error.to_string()))?;
+    if snapshot.version != VERSION {
+        return Err(StoreError::Invalid(format!(
+            "unsupported version {}",
+            snapshot.version
+        )));
     }
     Ok(Some(snapshot))
 }
 
 pub fn save_recovery(dir: &Path, snapshot: &RecoverySnapshot) -> Result<(), StoreError> {
-    let json =
-        serde_json::to_vec(snapshot).map_err(|source| StoreError::Encode { what: WHAT, source })?;
-    write_atomic(&dir.join(RECOVERY_FILE), &json)
+    write_atomic(dir, FILE, &serde_json::to_vec(snapshot)?)
 }
 
 pub fn discard_recovery(dir: &Path) -> Result<(), StoreError> {
-    remove_file_durably(&dir.join(RECOVERY_FILE))
+    remove_file(dir, FILE)
 }
 
 #[cfg(test)]
 mod tests {
-    use elizabeats_core::{RecoveryStatus, SourceId, StoredQueueItem, Track};
+    use elizabeats_core::{QueueItem, RecoveryStatus, SourceId, Track};
 
     use super::*;
 
@@ -58,9 +47,9 @@ mod tests {
             version: 1,
             status: RecoveryStatus::Interrupted,
             queue: vec![
-                StoredQueueItem::Track {
-                    id: "q1".into(),
-                    track: Track {
+                QueueItem::track(
+                    "q1",
+                    Track {
                         id: "Artist/Song.mp3".into(),
                         source: SourceId::Local,
                         title: "Song".into(),
@@ -70,8 +59,8 @@ mod tests {
                         artwork_url: None,
                         explicit: false,
                     },
-                },
-                StoredQueueItem::Break { id: "q2".into() },
+                ),
+                QueueItem::new_break("q2"),
             ],
             session_started_at: Some("2026-10-06T20:00:00.000Z".into()),
             updated_at: "2026-10-06T20:05:00.000Z".into(),
@@ -85,11 +74,6 @@ mod tests {
         save_recovery(dir.path(), &snapshot()).unwrap();
         assert_eq!(read_recovery(dir.path()).unwrap(), Some(snapshot()));
 
-        let mut clean = snapshot();
-        clean.status = RecoveryStatus::Clean;
-        save_recovery(dir.path(), &clean).unwrap();
-        assert_eq!(read_recovery(dir.path()).unwrap(), Some(clean));
-
         discard_recovery(dir.path()).unwrap();
         assert_eq!(read_recovery(dir.path()).unwrap(), None);
         discard_recovery(dir.path()).unwrap(); // Already gone is fine.
@@ -99,18 +83,18 @@ mod tests {
     fn reads_snapshots_written_by_the_electron_format() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.path().join(RECOVERY_FILE),
+            dir.path().join(FILE),
             r#"{"queue":[{"type":"break","id":"b"}],"sessionStartedAt":"s","status":"clean","updatedAt":"u","version":1}"#,
         )
         .unwrap();
         let read = read_recovery(dir.path()).unwrap().unwrap();
-        assert_eq!(read.queue, vec![StoredQueueItem::Break { id: "b".into() }]);
+        assert_eq!(read.queue, vec![QueueItem::new_break("b")]);
+        assert_eq!(read.status, RecoveryStatus::Clean);
     }
 
     #[test]
     fn invalid_snapshots_are_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(RECOVERY_FILE);
         for invalid in [
             "",
             "{trunc",
@@ -118,12 +102,10 @@ mod tests {
             r#"{"version":1,"status":"clean","queue":"nope","updatedAt":"u"}"#,
             r#"{"version":2,"status":"clean","queue":[],"updatedAt":"u"}"#,
         ] {
-            std::fs::write(&path, invalid).unwrap();
+            std::fs::write(dir.path().join(FILE), invalid).unwrap();
             let error = read_recovery(dir.path()).unwrap_err();
             assert!(
-                error
-                    .to_string()
-                    .starts_with("Queue recovery could not be read"),
+                matches!(error, StoreError::Invalid(_)),
                 "{invalid}: {error}"
             );
         }

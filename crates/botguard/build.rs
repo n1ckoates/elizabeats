@@ -22,7 +22,9 @@ fn main() {
         println!("cargo::rerun-if-changed={path}");
     }
 
-    if let Err(message) = install_if_needed(&js).and_then(|()| bundle(&js, &out_dir)) {
+    let bundled = install_if_needed(&js)
+        .and_then(|()| run("node", &["build.mjs", &out_dir.to_string_lossy()], &js));
+    if let Err(message) = bundled {
         // One `cargo::error` per line: Cargo doesn't show a build script's
         // own output when it reports errors this way.
         for line in message.lines() {
@@ -43,11 +45,6 @@ fn install_if_needed(js: &Path) -> Result<(), String> {
     run("pnpm", &["install", "--frozen-lockfile"], js)?;
     std::fs::write(&stamp, &lockfile)
         .map_err(|error| format!("could not write {}: {error}", stamp.display()))
-}
-
-fn bundle(js: &Path, out_dir: &Path) -> Result<(), String> {
-    let out_dir = out_dir.to_string_lossy();
-    run("node", &["build.mjs", &out_dir], js)
 }
 
 /// Runs `name` in `dir`. On failure, the error includes the end of the

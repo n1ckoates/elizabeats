@@ -1,8 +1,9 @@
 //! The Queue panel: Active Item pinned on top, Upcoming items below.
 
 use elizabeats_core::format::format_duration;
-use elizabeats_core::queue::{Direction, ItemKind, QueueItemRef, Readiness};
-use elizabeats_core::{SourceId, Track};
+use elizabeats_core::queue::{Direction, QueueItemRef};
+use elizabeats_core::session::{Readiness, Session};
+use elizabeats_core::{ItemKind, SourceId, Track};
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -11,12 +12,11 @@ use gpui_kit::component::empty::{
 };
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu};
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, h_flex, v_flex,
 };
 use gpui_kit::{
-    AnyElement, App, AppContext, ClickEvent, ClipboardItem, Context, DragMoveEvent, Entity,
+    AnyElement, App, AppContext, ClickEvent, ClipboardItem, Context, Div, DragMoveEvent, Entity,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, relative,
 };
@@ -29,7 +29,7 @@ use super::{
     AppView, ClearSelection, ExtendSelectionDown, ExtendSelectionUp, MoveSelectedDown,
     MoveSelectedUp, QUEUE_ROW_CONTEXT, RemoveSelected, SelectAll, SelectNext, SelectPrevious,
     alert_icon, break_tile, file_manager_name, section_label, tabular, track_artwork,
-    track_details,
+    track_details, with_tooltip,
 };
 use crate::station::Station;
 
@@ -56,32 +56,29 @@ enum Role {
 impl RowModel {
     /// `played_since_report` moves Playing items' positions on smoothly
     /// between the engine's progress reports.
-    fn from_item(index: usize, item: QueueItemRef<'_>, played_since_report: f64) -> Self {
-        let playing_progress = |progress: elizabeats_core::PlaybackProgress| {
+    fn new(
+        index: usize,
+        item: QueueItemRef<'_>,
+        session: &Session,
+        played_since_report: f64,
+    ) -> Self {
+        let role = match item {
+            QueueItemRef::Active(_) => Role::Active,
+            QueueItemRef::Incoming(_) => Role::Incoming,
+            QueueItemRef::Upcoming(_) => Role::Upcoming,
+        };
+        let progress = item.progress().map_or((0.0, 0.0), |progress| {
             (
                 progress.current_time + played_since_report,
                 progress.duration,
             )
-        };
-        let (role, readiness, progress) = match item {
-            QueueItemRef::Active(playing) => (
-                Role::Active,
-                Readiness::Ready,
-                playing_progress(playing.progress),
-            ),
-            QueueItemRef::Incoming(playing) => (
-                Role::Incoming,
-                Readiness::Ready,
-                playing_progress(playing.progress),
-            ),
-            QueueItemRef::Upcoming(upcoming) => (Role::Upcoming, upcoming.readiness, (0.0, 0.0)),
-        };
+        });
         Self {
             index,
             id: item.id().to_owned(),
             kind: item.kind().clone(),
             role,
-            readiness,
+            readiness: session.readiness(item),
             progress,
         }
     }
@@ -106,11 +103,7 @@ impl RowModel {
     }
 }
 
-fn station_command(
-    station: &Entity<Station>,
-    cx: &mut App,
-    run: impl FnOnce(&mut elizabeats_core::session::Session) -> Vec<elizabeats_core::session::Effect>,
-) {
+fn station_command(station: &Entity<Station>, cx: &mut App, run: impl FnOnce(&mut Session)) {
     station.update(cx, |station, cx| station.command(cx, run));
 }
 
@@ -130,7 +123,7 @@ impl AppView {
         let rows: Vec<RowModel> = queue
             .items()
             .enumerate()
-            .map(|(index, item)| RowModel::from_item(index, item, played_since_report))
+            .map(|(index, item)| RowModel::new(index, item, session, played_since_report))
             .collect();
         let crossfading = queue.is_crossfading();
         let error = session
@@ -186,14 +179,35 @@ impl AppView {
             .size_full()
             .min_w_0()
             .on_action(cx.listener(Self::on_remove_selected))
-            .on_action(cx.listener(Self::on_select_previous))
-            .on_action(cx.listener(Self::on_select_next))
-            .on_action(cx.listener(Self::on_extend_selection_up))
-            .on_action(cx.listener(Self::on_extend_selection_down))
-            .on_action(cx.listener(Self::on_select_all))
-            .on_action(cx.listener(Self::on_clear_selection))
-            .on_action(cx.listener(Self::on_move_selected_up))
-            .on_action(cx.listener(Self::on_move_selected_down))
+            .on_action(cx.listener(|this, _: &SelectPrevious, window, cx| {
+                this.select_step(Direction::Up, false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectNext, window, cx| {
+                this.select_step(Direction::Down, false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ExtendSelectionUp, window, cx| {
+                this.select_step(Direction::Up, true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ExtendSelectionDown, window, cx| {
+                this.select_step(Direction::Down, true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
+                let selectable = this.selectable_ids(cx);
+                this.selection.select_all(&selectable);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ClearSelection, _, cx| {
+                this.selection.clear();
+                cx.notify();
+            }))
+            .on_action(
+                cx.listener(|this, _: &MoveSelectedUp, _, cx| {
+                    this.move_selected(Direction::Up, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &MoveSelectedDown, _, cx| {
+                this.move_selected(Direction::Down, cx)
+            }))
             // Clicking anywhere outside the Queue panel deselects.
             .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
                 if !this.selection.is_empty() {
@@ -343,18 +357,7 @@ impl AppView {
                 this.selection.clear();
                 cx.notify();
             }))
-            .when(targeted, |el| {
-                el.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_3()
-                        .right_3()
-                        .h(px(2.))
-                        .rounded_full()
-                        .bg(accent),
-                )
-            })
+            .when(targeted, |el| el.child(insertion_line(accent)))
     }
 
     /// Marks `slot` as the drop target if dropping there would change the
@@ -393,7 +396,7 @@ impl AppView {
             return;
         };
         station_command(&self.station, cx, move |session| match action {
-            DropAction::InsertTrack { track, at } => session.insert_track_at(track, at, None),
+            DropAction::InsertTrack { track, at } => session.insert_track_at(track, at),
             DropAction::InsertBreak { at } => session.insert_break_at(at),
             DropAction::Move { item_ids, slot } => session.move_items(&item_ids, slot),
         });
@@ -651,18 +654,7 @@ impl AppView {
             .border_color(cx.theme().border)
             .bg(row_bg)
             .when(selectable, |el| el.hover(move |style| style.bg(hover_bg)))
-            .when(targeted, |el| {
-                el.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_3()
-                        .right_3()
-                        .h(px(2.))
-                        .rounded_full()
-                        .bg(accent),
-                )
-            })
+            .when(targeted, |el| el.child(insertion_line(accent)))
             .context_menu(move |menu, _, _| build_menu(menu, &context_actions, Some(3)))
             .child(content)
             .into_any_element()
@@ -705,59 +697,33 @@ impl AppView {
             format_duration(track.duration_seconds)
         };
 
+        let status_id = format!("status-{}", row.id);
         let status: Option<AnyElement> = match (row.role, row.readiness) {
             (Role::Active, _) => Some(equalizer(cx.theme().danger).into_any_element()),
-            (Role::Upcoming, Readiness::Preparing) => Some(
-                div()
-                    .id(SharedString::from(format!("status-{}", row.id)))
-                    .tooltip(|window, cx| Tooltip::new("Preparing").build(window, cx))
-                    .child(Spinner::new().xsmall())
-                    .into_any_element(),
-            ),
-            (Role::Incoming, _) => Some(
-                div()
-                    .id(SharedString::from(format!("status-{}", row.id)))
-                    .tooltip(|window, cx| Tooltip::new("Crossfading in").build(window, cx))
-                    .child(
-                        Icon::new(Lucide::Volume2)
-                            .xsmall()
-                            .text_color(cx.theme().muted_foreground),
-                    )
-                    .into_any_element(),
-            ),
-            (Role::Upcoming, Readiness::Unavailable) => Some(
-                div()
-                    .id(SharedString::from(format!("status-{}", row.id)))
-                    .tooltip(|window, cx| Tooltip::new("Track unavailable").build(window, cx))
-                    .child(alert_icon(cx).xsmall())
-                    .into_any_element(),
-            ),
-            _ => None,
+            (Role::Incoming, _) => Some(with_tooltip(
+                status_id,
+                "Crossfading in",
+                Icon::new(Lucide::Volume2)
+                    .xsmall()
+                    .text_color(cx.theme().muted_foreground),
+            )),
+            (Role::Upcoming, Readiness::Preparing) => Some(with_tooltip(
+                status_id,
+                "Preparing",
+                Spinner::new().xsmall(),
+            )),
+            (Role::Upcoming, Readiness::Unavailable) => Some(with_tooltip(
+                status_id,
+                "Track unavailable",
+                alert_icon(cx).xsmall(),
+            )),
+            (Role::Upcoming, Readiness::Ready) => None,
         };
 
-        let mut artwork = track_artwork(image, row.size().media(), cx);
-        if row.role == Role::Upcoming {
-            let station = self.station.clone();
-            let id = row.id.clone();
-            artwork = artwork.child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .invisible()
-                    .group_hover(group.clone(), |style| style.visible())
-                    .child(
-                        Button::new(SharedString::from(format!("play-{}", row.id)))
-                            .primary()
-                            .size_full()
-                            .icon(IconName::Play)
-                            .tooltip(format!("Play {}", track.title))
-                            .disabled(row.readiness == Readiness::Preparing)
-                            .on_click(move |_, _, cx| {
-                                station_command(&station, cx, |session| session.play_item(&id))
-                            }),
-                    ),
-            );
-        }
+        let artwork = track_artwork(image, row.size().media(), cx)
+            .when(row.role == Role::Upcoming, |artwork| {
+                artwork.child(self.play_overlay(row, format!("Play {}", track.title), group))
+            });
 
         // Fills the outer row, whose fixed height includes the divider.
         super::row(row.size())
@@ -820,28 +786,11 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let active = row.role == Role::Active;
-        let mut tile = break_tile(row.size().media(), cx).relative();
-        if !active {
-            let station = self.station.clone();
-            let id = row.id.clone();
-            tile = tile.child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .invisible()
-                    .group_hover(group.clone(), |style| style.visible())
-                    .child(
-                        Button::new(SharedString::from(format!("play-{}", row.id)))
-                            .primary()
-                            .size_full()
-                            .icon(IconName::Play)
-                            .tooltip("Play break")
-                            .on_click(move |_, _, cx| {
-                                station_command(&station, cx, |session| session.play_item(&id))
-                            }),
-                    ),
-            );
-        }
+        let tile = break_tile(row.size().media(), cx)
+            .relative()
+            .when(!active, |tile| {
+                tile.child(self.play_overlay(row, "Play break".to_owned(), group))
+            });
         super::row(row.size())
             .h_full()
             .child(tile)
@@ -854,13 +803,34 @@ impl AppView {
             )
     }
 
+    /// The "Play now" button shown over an Upcoming row's artwork on hover.
+    fn play_overlay(&self, row: &RowModel, tooltip: String, group: &SharedString) -> Div {
+        let station = self.station.clone();
+        let id = row.id.clone();
+        div()
+            .absolute()
+            .inset_0()
+            .invisible()
+            .group_hover(group.clone(), |style| style.visible())
+            .child(
+                Button::new(SharedString::from(format!("play-{}", row.id)))
+                    .primary()
+                    .size_full()
+                    .icon(IconName::Play)
+                    .tooltip(tooltip)
+                    .disabled(row.readiness == Readiness::Preparing)
+                    .on_click(move |_, _, cx| {
+                        station_command(&station, cx, |session| session.play_item(&id))
+                    }),
+            )
+    }
+
     // ---- Keyboard ----------------------------------------------------------
 
-    /// Focuses the row at `index` if it's an Upcoming item (others can't be selected).
     /// IDs of the items that can be selected (the Upcoming ones), in order.
     pub(super) fn selectable_ids(&self, cx: &App) -> Vec<String> {
         let queue = self.station.read(cx).session().queue();
-        queue.queued().iter().map(|item| item.id.clone()).collect()
+        queue.upcoming.iter().map(|item| item.id.clone()).collect()
     }
 
     /// The selectable item one step up or down from the focused row.
@@ -917,48 +887,6 @@ impl AppView {
         self.focus_row(&id, window, cx);
     }
 
-    fn on_select_previous(
-        &mut self,
-        _: &SelectPrevious,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.select_step(Direction::Up, false, window, cx);
-    }
-
-    fn on_select_next(&mut self, _: &SelectNext, window: &mut Window, cx: &mut Context<Self>) {
-        self.select_step(Direction::Down, false, window, cx);
-    }
-
-    fn on_extend_selection_up(
-        &mut self,
-        _: &ExtendSelectionUp,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.select_step(Direction::Up, true, window, cx);
-    }
-
-    fn on_extend_selection_down(
-        &mut self,
-        _: &ExtendSelectionDown,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.select_step(Direction::Down, true, window, cx);
-    }
-
-    fn on_select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        let selectable = self.selectable_ids(cx);
-        self.selection.select_all(&selectable);
-        cx.notify();
-    }
-
-    fn on_clear_selection(&mut self, _: &ClearSelection, _: &mut Window, cx: &mut Context<Self>) {
-        self.selection.clear();
-        cx.notify();
-    }
-
     fn move_selected(&mut self, direction: Direction, cx: &mut Context<Self>) {
         let ids = self.selection.ordered(&self.selectable_ids(cx));
         if !ids.is_empty() {
@@ -966,19 +894,6 @@ impl AppView {
                 session.step_items(&ids, direction)
             });
         }
-    }
-
-    fn on_move_selected_up(&mut self, _: &MoveSelectedUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selected(Direction::Up, cx);
-    }
-
-    fn on_move_selected_down(
-        &mut self,
-        _: &MoveSelectedDown,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.move_selected(Direction::Down, cx);
     }
 }
 
@@ -996,7 +911,6 @@ pub(super) fn track_link_action(track: &Track, station: &Entity<Station>, cx: &A
                     }
                 },
             )
-            .disabled(false)
         }
         SourceId::YoutubeMusic => {
             let url = track.youtube_music_url().unwrap_or_default();
@@ -1005,6 +919,18 @@ pub(super) fn track_link_action(track: &Track, station: &Entity<Station>, cx: &A
             })
         }
     }
+}
+
+/// Where a dragged item would drop: a line along the top of the target.
+fn insertion_line(color: gpui_kit::Hsla) -> Div {
+    div()
+        .absolute()
+        .top_0()
+        .left_3()
+        .right_3()
+        .h(px(2.))
+        .rounded_full()
+        .bg(color)
 }
 
 /// The "now playing" equalizer: three bars bouncing at different speeds.

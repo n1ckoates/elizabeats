@@ -5,8 +5,9 @@
 use std::path::Path;
 use std::time::Duration;
 
-use elizabeats_core::queue::ItemKind;
-use elizabeats_core::{AppSettings, RecoverySnapshot, RecoveryStatus, StoredQueueItem};
+use elizabeats_core::queue::QueueItemRef;
+use elizabeats_core::session::{Readiness, Session};
+use elizabeats_core::{AppSettings, ItemKind, QueueItem, RecoverySnapshot, RecoveryStatus};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
     AnyWindowHandle, AppContext, Bounds, Entity, Point, TestAppContext, WindowBounds,
@@ -49,6 +50,22 @@ fn queue_len(view: &Entity<AppView>, cx: &mut TestAppContext) -> usize {
     view.read_with(cx, |view, cx| view.station.read(cx).session().queue().len())
 }
 
+/// The Queue's item ids in display order.
+fn queue_ids(view: &Entity<AppView>, cx: &mut TestAppContext) -> Vec<String> {
+    view.read_with(cx, |view, cx| {
+        let queue = view.station.read(cx).session().queue();
+        queue.items().map(|item| item.id().to_owned()).collect()
+    })
+}
+
+/// Runs a Session command through the Station, as the UI does.
+fn command(view: &Entity<AppView>, cx: &mut TestAppContext, run: impl FnOnce(&mut Session)) {
+    view.update(cx, |view, cx| {
+        view.station
+            .update(cx, |station, cx| station.command(cx, run));
+    });
+}
+
 /// A one-second silent mono WAV.
 fn write_wav(path: &Path) {
     let rate: u32 = 8000;
@@ -86,7 +103,7 @@ async fn starts_empty_and_add_break_inserts_a_break(cx: &mut TestAppContext) {
     assert_eq!(queue_len(&view, cx), 1);
     let is_break = view.read_with(cx, |view, cx| {
         let station = view.station.read(cx);
-        matches!(station.session().queue().queued()[0].kind, ItemKind::Break)
+        matches!(station.session().queue().upcoming[0].kind, ItemKind::Break)
     });
     assert!(is_break);
 }
@@ -108,17 +125,11 @@ async fn keyboard_shortcut_inserts_a_break(cx: &mut TestAppContext) {
 async fn delete_key_removes_the_focused_row(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let (window, view) = open_app(cx, dir.path());
-    view.update(cx, |view, cx| {
-        view.station.update(cx, |station, cx| {
-            station.command(cx, |session| session.insert_break(None));
-            station.command(cx, |session| session.insert_break(None));
-        });
+    command(&view, cx, |session| {
+        session.insert_break(None);
+        session.insert_break(None);
     });
-    let first = view.read_with(cx, |view, cx| {
-        view.station.read(cx).session().queue().queued()[0]
-            .id
-            .clone()
-    });
+    let first = queue_ids(&view, cx)[0].clone();
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
         window.click(
@@ -130,11 +141,7 @@ async fn delete_key_removes_the_focused_row(cx: &mut TestAppContext) {
     .unwrap();
     cx.run_until_parked();
     assert_eq!(queue_len(&view, cx), 1);
-    let remaining = view.read_with(cx, |view, cx| {
-        view.station.read(cx).session().queue().queued()[0]
-            .id
-            .clone()
-    });
+    let remaining = queue_ids(&view, cx)[0].clone();
     assert_ne!(remaining, first);
 }
 
@@ -145,12 +152,8 @@ fn write_interrupted_recovery(dir: &Path) {
             version: 1,
             status: RecoveryStatus::Interrupted,
             queue: vec![
-                StoredQueueItem::Break {
-                    id: "saved-1".into(),
-                },
-                StoredQueueItem::Break {
-                    id: "saved-2".into(),
-                },
+                QueueItem::new_break("saved-1"),
+                QueueItem::new_break("saved-2"),
             ],
             session_started_at: Some("2026-10-06T20:00:00.000Z".into()),
             updated_at: "2026-10-06T21:00:00.000Z".into(),
@@ -262,18 +265,14 @@ async fn local_track_can_be_dragged_from_search_into_the_queue(cx: &mut TestAppC
     cx.run_until_parked();
     assert_eq!(queue_len(&view, cx), 1);
     let title = view.read_with(cx, |view, cx| {
-        view.station.read(cx).session().queue().queued()[0]
+        view.station.read(cx).session().queue().upcoming[0]
             .kind
             .clone()
     });
     assert!(matches!(title, ItemKind::Track(track) if track.title == "Station ID"));
 
     // A queued Track's row is exactly as tall as its search result row.
-    let id = view.read_with(cx, |view, cx| {
-        view.station.read(cx).session().queue().queued()[0]
-            .id
-            .clone()
-    });
+    let id = queue_ids(&view, cx)[0].clone();
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
         let height = |id: String| {
@@ -338,32 +337,21 @@ async fn plays_local_tracks_end_to_end(cx: &mut TestAppContext) {
     });
 
     let tracks: Vec<_> = view.read_with(cx, |view, cx| view.search.read(cx).tracks().to_vec());
-    view.update(cx, |view, cx| {
-        view.station.update(cx, |station, cx| {
-            for track in tracks {
-                station.command(cx, |session| session.add_track_to_end(track));
-            }
-        });
+    command(&view, cx, |session| {
+        for track in tracks {
+            session.add_track_to_end(track);
+        }
     });
     wait(cx, &view, "tracks ready", &|view, cx| {
         view.station
             .read(cx)
             .session()
             .queue()
-            .queued()
-            .iter()
-            .all(|item| item.readiness == elizabeats_core::queue::Readiness::Ready)
+            .items()
+            .all(|item| view.station.read(cx).session().readiness(item) == Readiness::Ready)
     });
-    let first = view.read_with(cx, |view, cx| {
-        view.station.read(cx).session().queue().queued()[0]
-            .id
-            .clone()
-    });
-    view.update(cx, |view, cx| {
-        view.station.update(cx, |station, cx| {
-            station.command(cx, |session| session.play_item(&first))
-        })
-    });
+    let first = queue_ids(&view, cx)[0].clone();
+    command(&view, cx, |session| session.play_item(&first));
 
     wait(cx, &view, "both tracks to finish", &|view, cx| {
         let session = view.station.read(cx).session();
@@ -390,8 +378,6 @@ async fn plays_local_tracks_end_to_end(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 #[ignore = "needs network access to YouTube and a built app binary"]
 async fn youtube_track_downloads_and_becomes_ready(cx: &mut TestAppContext) {
-    use elizabeats_core::queue::Readiness;
-
     let dir = tempfile::tempdir().unwrap();
     let helper =
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/elizabeats");
@@ -430,7 +416,7 @@ async fn youtube_track_downloads_and_becomes_ready(cx: &mut TestAppContext) {
         let (readiness, error) = station.read_with(cx, |station, _| {
             let session = station.session();
             (
-                session.queue().queued()[0].readiness,
+                session.readiness(QueueItemRef::Upcoming(&session.queue().upcoming[0])),
                 session.playback_error().map(str::to_owned),
             )
         });
@@ -465,22 +451,16 @@ async fn youtube_track_downloads_and_becomes_ready(cx: &mut TestAppContext) {
 async fn cannot_drop_above_the_active_item(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let (window, view) = open_app(cx, dir.path());
-    view.update(cx, |view, cx| {
-        view.station.update(cx, |station, cx| {
-            station.command(cx, |session| session.insert_break(None));
-            station.command(cx, |session| session.insert_break(None));
-        });
+    command(&view, cx, |session| {
+        session.insert_break(None);
+        session.insert_break(None);
     });
-    let (active, upcoming) = view.read_with(cx, |view, cx| {
-        let queue = view.station.read(cx).session().queue();
-        (queue.queued()[0].id.clone(), queue.queued()[1].id.clone())
-    });
+    let (active, upcoming) = {
+        let ids = queue_ids(&view, cx);
+        (ids[0].clone(), ids[1].clone())
+    };
     // Playing a Break makes it the Active Item without any audio.
-    view.update(cx, |view, cx| {
-        view.station.update(cx, |station, cx| {
-            station.command(cx, |session| session.play_item(&active))
-        })
-    });
+    command(&view, cx, |session| session.play_item(&active));
     cx.run_until_parked();
 
     cx.update_window(window, |_, window, cx| {
@@ -495,17 +475,8 @@ async fn cannot_drop_above_the_active_item(cx: &mut TestAppContext) {
     })
     .unwrap();
     cx.run_until_parked();
-    let (ids, slot) = view.read_with(cx, |view, cx| {
-        let ids: Vec<String> = view
-            .station
-            .read(cx)
-            .session()
-            .queue()
-            .items()
-            .map(|item| item.id().to_owned())
-            .collect();
-        (ids, view.drop_slot)
-    });
+    let ids = queue_ids(&view, cx);
+    let slot = view.read_with(cx, |view, _| view.drop_slot);
     assert_eq!(ids, vec![active, upcoming], "the Active Item stays first");
     assert_eq!(slot, None);
 }
@@ -572,11 +543,9 @@ async fn drop_target_clears_when_the_cursor_leaves_the_queue(cx: &mut TestAppCon
 async fn add_break_goes_above_the_selected_row(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let (window, view) = open_app(cx, dir.path());
-    view.update(cx, |view, cx| {
-        view.station.update(cx, |station, cx| {
-            station.command(cx, |session| session.insert_break(None));
-            station.command(cx, |session| session.insert_break(None));
-        });
+    command(&view, cx, |session| {
+        session.insert_break(None);
+        session.insert_break(None);
     });
     let ids = |cx: &mut TestAppContext| {
         view.read_with(cx, |view, cx| {
@@ -818,7 +787,7 @@ async fn about_page_shows_version_and_dev_builds_dont_update(cx: &mut TestAppCon
     let (window, view) = open_app(cx, dir.path());
     assert!(VERSION_LABEL.contains("-dev ("), "{VERSION_LABEL}");
     let status = view.read_with(cx, |view, cx| view.updates.read(cx).status().clone());
-    assert_eq!(status, UpdateStatus::DevBuild);
+    assert!(matches!(status, UpdateStatus::DevBuild));
 
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
@@ -845,7 +814,7 @@ async fn about_page_shows_version_and_dev_builds_dont_update(cx: &mut TestAppCon
     .unwrap();
     cx.run_until_parked();
     let status = view.read_with(cx, |view, cx| view.updates.read(cx).status().clone());
-    assert_eq!(status, UpdateStatus::DevBuild);
+    assert!(matches!(status, UpdateStatus::DevBuild));
 }
 
 /// Only Upcoming items can be selected: clicking the Active Item does
@@ -854,22 +823,16 @@ async fn about_page_shows_version_and_dev_builds_dont_update(cx: &mut TestAppCon
 async fn only_upcoming_items_can_be_selected(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let (window, view) = open_app(cx, dir.path());
-    view.update(cx, |view, cx| {
-        view.station.update(cx, |station, cx| {
-            station.command(cx, |session| session.insert_break(None));
-            station.command(cx, |session| session.insert_break(None));
-        });
+    command(&view, cx, |session| {
+        session.insert_break(None);
+        session.insert_break(None);
     });
-    let (active, upcoming) = view.read_with(cx, |view, cx| {
-        let queue = view.station.read(cx).session().queue();
-        (queue.queued()[0].id.clone(), queue.queued()[1].id.clone())
-    });
+    let (active, upcoming) = {
+        let ids = queue_ids(&view, cx);
+        (ids[0].clone(), ids[1].clone())
+    };
     // Playing a Break makes it the Active Item without any audio.
-    view.update(cx, |view, cx| {
-        view.station.update(cx, |station, cx| {
-            station.command(cx, |session| session.play_item(&active))
-        })
-    });
+    command(&view, cx, |session| session.play_item(&active));
     cx.run_until_parked();
 
     let selected = |cx: &mut TestAppContext| {

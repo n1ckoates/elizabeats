@@ -1,35 +1,30 @@
 //! The playout Session: a pure state machine over the Queue.
 //!
 //! The Session never performs I/O. DJ commands and engine events go in; it
-//! updates its state and returns [`Effect`]s (play this file, save recovery,
-//! prepare a Track, ...) that the application executes. Results come back as
-//! more events. Every audio load gets a fresh [`LoadId`], so late events from
+//! updates its state and queues [`Effect`]s (play this file, save recovery,
+//! prepare a Track, ...) that the application collects with
+//! [`Session::take_effects`] and executes. Results come back as more events. Every audio load gets a fresh [`LoadId`], so late events from
 //! audio that has already been replaced are ignored instead of corrupting
 //! the Queue.
 //!
-//! Safety rules (see README "Queue and playback invariants"):
+//! Safety rules (vocabulary in CONTEXT.md):
 //! - only DJ-authored items play; an empty Queue never starts by itself;
 //! - a Break blocks automatic advancement until it is skipped;
 //! - crossfades happen only between adjacent Tracks, never across a Break;
 //! - if the next Track is not ready in time, playback stops and says so;
 //! - the Play Log records only items that actually began Playing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 
 use crate::domain::{
-    DiagnosticEvent, PlayLogEntry, PlayLogReason, PlaybackProgress, RecoverySnapshot,
-    RecoveryStatus, SourceId, StoredQueueItem, Track, TrackKey,
+    DiagnosticEvent, PlayLogEntry, PlayLogReason, PlaybackProgress, QueueItem, RecoverySnapshot,
+    RecoveryStatus, SourceId, Track, TrackKey,
 };
-use crate::queue::{
-    Direction, ItemKind, PlayingItem, Queue, QueueCommand, QueueItemRef, Readiness, UpcomingItem,
-    edit_queue,
-};
-
-/// Identifies one file loaded into the audio engine.
-pub type LoadId = u64;
+pub use crate::queue::LoadId;
+use crate::queue::{Direction, Playback, PlayingItem, Queue, QueueItemRef};
 
 /// Identifies one Track preparation request.
 pub type RequestId = u64;
@@ -54,25 +49,21 @@ pub enum AudioCommand {
     Stop,
 }
 
-/// Engine notifications, mirrored from the audio crate.
+/// Notifications from the audio engine.
 #[derive(Clone, Debug, PartialEq)]
 pub enum AudioEvent {
+    /// Periodic (~every 100 ms) while a deck with this id is loaded and playing.
     Progress {
         id: LoadId,
         position_secs: f64,
         duration_secs: Option<f64>,
     },
-    Ended {
-        id: LoadId,
-    },
-    Failed {
-        id: LoadId,
-        message: String,
-    },
-    CrossfadeComplete {
-        outgoing: LoadId,
-        incoming: LoadId,
-    },
+    /// The deck's audio has fully played out to the device.
+    Ended { id: LoadId },
+    /// The deck failed (file missing/undecodable, decode error mid-stream, output device lost).
+    Failed { id: LoadId, message: String },
+    /// A crossfade's gain ramps finished (outgoing is now silent, incoming at full gain).
+    CrossfadeComplete { outgoing: LoadId, incoming: LoadId },
 }
 
 /// Work the application performs on the Session's behalf.
@@ -88,41 +79,26 @@ pub enum Effect {
     DiscardRecovery,
     /// Insert or replace (by entry id) one Play Log entry.
     SavePlayLogEntry(PlayLogEntry),
-    ClearPlayLog,
     /// Tracks in the Queue must not be evicted from the Download Cache.
     ProtectTracks(Vec<Track>),
     RecordYoutubePlay(String),
     Diagnostic(DiagnosticEvent),
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum RecoveryState {
-    Checking,
-    None,
-    Pending(RecoverySnapshot),
+/// Whether an Upcoming item is ready to play.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Readiness {
+    Preparing,
+    Ready,
+    Unavailable,
 }
 
+/// The audio file behind a Track, per Track (shared by repeated Queue items).
 #[derive(Clone, Debug, PartialEq)]
 enum Preparation {
     Pending(RequestId),
     Ready(PathBuf),
-}
-
-/// A start that is waiting for a Track to finish preparing.
-#[derive(Clone, Debug, PartialEq)]
-enum PendingStart {
-    /// Start `item_id` from a stopped Queue.
-    Play { item_id: String },
-    /// Crossfade from `active_id` into `item_id` (a manual skip / play now).
-    Crossfade { active_id: String, item_id: String },
-}
-
-impl PendingStart {
-    fn item_id(&self) -> &str {
-        match self {
-            Self::Play { item_id } | Self::Crossfade { item_id, .. } => item_id,
-        }
-    }
+    Failed,
 }
 
 type Clock = Box<dyn Fn() -> DateTime<Utc> + Send>;
@@ -130,23 +106,15 @@ type IdSource = Box<dyn FnMut() -> String + Send>;
 
 pub struct Session {
     queue: Queue,
+    preparations: HashMap<TrackKey, Preparation>,
     play_log: Vec<PlayLogEntry>,
     playback_error: Option<String>,
-    recovery: RecoveryState,
+    /// An interrupted Queue the DJ has not yet recovered or discarded.
+    recovery: Option<RecoverySnapshot>,
     session_started_at: DateTime<Utc>,
     crossfade_seconds: u32,
-
-    preparations: HashMap<TrackKey, Preparation>,
-    pending: Option<PendingStart>,
-    active_load: Option<LoadId>,
-    incoming_load: Option<LoadId>,
-    /// The active Track has already asked for its automatic crossfade.
-    crossfade_requested: bool,
-    /// The running crossfade was manual: promote as soon as the fade completes.
-    complete_after_fade: bool,
-
-    next_load: LoadId,
-    next_request: RequestId,
+    /// Source of load and request ids.
+    next_id: u64,
     clock: Clock,
     ids: IdSource,
     effects: Vec<Effect>,
@@ -165,54 +133,28 @@ fn timestamp(time: DateTime<Utc>) -> String {
     time.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-fn requeue(item: QueueItemRef<'_>) -> UpcomingItem {
-    match item {
-        QueueItemRef::Upcoming(item) => item.clone(),
-        QueueItemRef::Active(item) | QueueItemRef::Incoming(item) => UpcomingItem {
-            id: item.id.clone(),
-            kind: item.kind.clone(),
-            readiness: Readiness::Ready,
-        },
-    }
-}
-
-fn playing(item: UpcomingItem) -> PlayingItem {
-    let duration = match &item.kind {
-        ItemKind::Track(track) => track.duration_seconds.unwrap_or(0.0),
-        ItemKind::Break => 0.0,
-    };
-    PlayingItem {
-        id: item.id,
-        kind: item.kind,
-        progress: PlaybackProgress {
-            current_time: 0.0,
-            duration,
-        },
-    }
-}
-
 impl Session {
     pub fn new(clock: Clock, ids: IdSource) -> Self {
         let now = clock();
         Self {
             queue: Queue::default(),
+            preparations: HashMap::new(),
             play_log: Vec::new(),
             playback_error: None,
-            recovery: RecoveryState::Checking,
+            recovery: None,
             session_started_at: now,
             crossfade_seconds: 3,
-            preparations: HashMap::new(),
-            pending: None,
-            active_load: None,
-            incoming_load: None,
-            crossfade_requested: false,
-            complete_after_fade: false,
-            next_load: 1,
-            next_request: 1,
+            next_id: 1,
             clock,
             ids,
             effects: Vec::new(),
         }
+    }
+
+    /// The effects queued by the commands since the last call, in order.
+    #[must_use]
+    pub fn take_effects(&mut self) -> Vec<Effect> {
+        std::mem::take(&mut self.effects)
     }
 
     // ---- Read access -------------------------------------------------------
@@ -230,8 +172,8 @@ impl Session {
         self.playback_error.as_deref()
     }
 
-    pub fn recovery(&self) -> &RecoveryState {
-        &self.recovery
+    pub fn pending_recovery(&self) -> Option<&RecoverySnapshot> {
+        self.recovery.as_ref()
     }
 
     pub fn session_started_at(&self) -> DateTime<Utc> {
@@ -242,9 +184,19 @@ impl Session {
         self.crossfade_seconds
     }
 
-    /// Closing while audio plays needs the DJ's confirmation.
-    pub fn needs_close_confirmation(&self) -> bool {
-        !self.queue.is_stopped()
+    /// Breaks are always ready; Playing items are ready by definition.
+    pub fn readiness(&self, item: QueueItemRef<'_>) -> Readiness {
+        if !matches!(item, QueueItemRef::Upcoming(_)) {
+            return Readiness::Ready;
+        }
+        let Some(track) = item.track() else {
+            return Readiness::Ready;
+        };
+        match self.preparations.get(&track.key()) {
+            Some(Preparation::Ready(_)) => Readiness::Ready,
+            Some(Preparation::Failed) => Readiness::Unavailable,
+            Some(Preparation::Pending(_)) | None => Readiness::Preparing,
+        }
     }
 
     /// The Play Log entry of the item currently Playing as the Active Item.
@@ -252,259 +204,189 @@ impl Session {
         let active = self.queue.active()?;
         self.play_log
             .iter()
-            .find(|entry| entry.item.id() == active.id && entry.ended_at.is_none())
+            .find(|entry| entry.item.id == active.item.id && entry.ended_at.is_none())
     }
 
     // ---- Queue editing -----------------------------------------------------
 
-    #[must_use]
-    pub fn add_track_to_end(&mut self, track: Track) -> Vec<Effect> {
-        let at = self.queue.len();
-        self.insert_track_at(track, at, None)
+    pub fn add_track_to_end(&mut self, track: Track) {
+        self.insert_track_at(track, usize::MAX);
     }
 
-    #[must_use]
-    pub fn add_track_next(&mut self, track: Track) -> Vec<Effect> {
-        let at = self.queue.first_mutable_index();
-        self.insert_track_at(track, at, None)
+    pub fn add_track_next(&mut self, track: Track) {
+        self.insert_track_at(track, 0);
     }
 
-    /// `item_id` lets the UI know the new item's id ahead of time (for drop animations).
-    #[must_use]
-    pub fn insert_track_at(
-        &mut self,
-        track: Track,
-        at: usize,
-        item_id: Option<String>,
-    ) -> Vec<Effect> {
-        let item_id = item_id.unwrap_or_else(|| (self.ids)());
-        self.update_queue(QueueCommand::InsertTrack { at, item_id, track });
-        self.take_effects()
+    pub fn insert_track_at(&mut self, track: Track, at: usize) {
+        let item = QueueItem::track((self.ids)(), track);
+        self.edit(|queue| queue.insert(at, item));
     }
 
-    #[must_use]
-    pub fn insert_break_at(&mut self, at: usize) -> Vec<Effect> {
-        let item_id = (self.ids)();
-        self.update_queue(QueueCommand::InsertBreak { at, item_id });
-        self.take_effects()
+    pub fn insert_break_at(&mut self, at: usize) {
+        let item = QueueItem::new_break((self.ids)());
+        self.edit(|queue| queue.insert(at, item));
     }
 
-    #[must_use]
-    pub fn insert_break_after(&mut self, after_id: &str) -> Vec<Effect> {
-        let item_id = (self.ids)();
-        self.update_queue(QueueCommand::InsertBreakAfter {
-            after_id: after_id.to_owned(),
-            item_id,
-        });
-        self.take_effects()
+    pub fn insert_break_after(&mut self, after_id: &str) {
+        if let Some(index) = self.queue.index_of(after_id) {
+            self.insert_break_at(index + 1);
+        }
     }
 
     /// "Add Break": right above `selected` (the selected item), else at the
     /// end of the Queue.
-    #[must_use]
-    pub fn insert_break(&mut self, selected: Option<&str>) -> Vec<Effect> {
-        let at = selected
-            .and_then(|id| self.queue.items().position(|item| item.id() == id))
-            .unwrap_or(self.queue.len());
-        self.insert_break_at(at)
+    pub fn insert_break(&mut self, selected: Option<&str>) {
+        let at = selected.and_then(|id| self.queue.index_of(id));
+        self.insert_break_at(at.unwrap_or(usize::MAX));
     }
 
-    #[must_use]
-    pub fn remove_items(&mut self, item_ids: &[String]) -> Vec<Effect> {
-        self.update_queue(QueueCommand::Remove {
-            item_ids: item_ids.to_vec(),
-        });
-        self.take_effects()
+    pub fn remove_items(&mut self, item_ids: &[String]) {
+        self.edit(|queue| queue.remove(item_ids));
     }
 
     /// Moves these items together, in Queue order, to display slot `slot`.
-    #[must_use]
-    pub fn move_items(&mut self, item_ids: &[String], slot: usize) -> Vec<Effect> {
-        self.update_queue(QueueCommand::Move {
-            item_ids: item_ids.to_vec(),
-            slot,
-        });
-        self.take_effects()
+    pub fn move_items(&mut self, item_ids: &[String], slot: usize) {
+        self.edit(|queue| queue.move_to(item_ids, slot));
     }
 
     /// Moves each of these items one place, or none if any can't move.
-    #[must_use]
-    pub fn step_items(&mut self, item_ids: &[String], direction: Direction) -> Vec<Effect> {
-        self.update_queue(QueueCommand::Step {
-            item_ids: item_ids.to_vec(),
-            direction,
-        });
-        self.take_effects()
+    pub fn step_items(&mut self, item_ids: &[String], direction: Direction) {
+        self.edit(|queue| queue.step(item_ids, direction));
     }
 
     // ---- Transport ---------------------------------------------------------
 
     /// "Play now" for an Upcoming item.
-    #[must_use]
-    pub fn play_item(&mut self, item_id: &str) -> Vec<Effect> {
-        let Some(QueueItemRef::Upcoming(item)) = self.queue.item(item_id) else {
-            return self.take_effects();
+    pub fn play_item(&mut self, item_id: &str) {
+        let Some(item) = self.queue.upcoming.iter().find(|item| item.id == item_id) else {
+            return;
         };
-        if item.readiness == Readiness::Preparing {
-            return self.take_effects();
+        let readiness = self.readiness(QueueItemRef::Upcoming(item));
+        if readiness == Readiness::Preparing {
+            return;
         }
-        let is_track = matches!(item.kind, ItemKind::Track(_));
-        let retry = item.readiness == Readiness::Unavailable;
+        let key = item.as_track().map(Track::key);
         self.playback_error = None;
-        if retry {
-            self.set_readiness(item_id, Readiness::Preparing);
+        if let Some(key) = &key {
+            self.retry_if_failed(key);
         }
-        let active_is_track = self
-            .queue
-            .active()
-            .is_some_and(|active| matches!(active.kind, ItemKind::Track(_)));
-        if is_track && active_is_track && !self.queue.is_crossfading() {
+        if key.is_some() && self.active_track_playing() {
             self.crossfade_to(item_id);
         } else {
             self.restart_from(item_id);
         }
-        self.take_effects()
     }
 
     /// Skip the Active Item (crossfading into the next Track when adjacent).
-    #[must_use]
-    pub fn skip(&mut self) -> Vec<Effect> {
-        let Some(active) = self.queue.active() else {
-            return self.take_effects();
-        };
-        if self.queue.is_crossfading() {
-            self.promote_incoming(PlayLogReason::Skipped, false);
-            return self.take_effects();
-        }
-        let active_is_track = matches!(active.kind, ItemKind::Track(_));
-        let next_track_id = self
-            .queue
-            .queued()
-            .first()
-            .filter(|next| matches!(next.kind, ItemKind::Track(_)))
-            .map(|next| next.id.clone());
-        match next_track_id {
-            Some(next_id) if active_is_track => {
-                if self
+    pub fn skip(&mut self) {
+        match &self.queue.playback {
+            Playback::Stopped { .. } => {}
+            Playback::Crossfading { .. } => self.promote_incoming(PlayLogReason::Skipped, true),
+            Playback::Playing { .. } => {
+                // Crossfade when a Track follows a Track; otherwise stop and
+                // move on (into a Break, or to the end of the Queue).
+                let next_track = self
                     .queue
-                    .queued()
+                    .upcoming
                     .first()
-                    .is_some_and(|next| next.readiness == Readiness::Unavailable)
-                {
-                    self.set_readiness(&next_id, Readiness::Preparing);
+                    .filter(|next| next.as_track().is_some())
+                    .cloned();
+                match next_track {
+                    Some(next) if self.active_track_playing() => {
+                        if let Some(track) = next.as_track() {
+                            self.retry_if_failed(&track.key());
+                        }
+                        self.playback_error = None;
+                        self.crossfade_to(&next.id);
+                    }
+                    _ => {
+                        self.audio(AudioCommand::Stop);
+                        self.advance(PlayLogReason::Skipped);
+                    }
                 }
-                self.playback_error = None;
-                self.crossfade_to(&next_id);
-            }
-            _ => {
-                self.stop_audio();
-                self.advance(PlayLogReason::Skipped);
             }
         }
-        self.take_effects()
     }
 
     // ---- Engine and service results ----------------------------------------
 
-    #[must_use]
-    pub fn audio_event(&mut self, event: AudioEvent) -> Vec<Effect> {
+    pub fn audio_event(&mut self, event: AudioEvent) {
         match event {
             AudioEvent::Progress {
                 id,
                 position_secs,
                 duration_secs,
             } => self.on_progress(id, position_secs, duration_secs),
-            AudioEvent::Ended { id } => {
-                if Some(id) == self.active_load {
-                    // The engine already promoted its incoming deck, if any.
-                    self.promote_incoming(PlayLogReason::Completed, true);
-                } else if Some(id) == self.incoming_load {
-                    self.incoming_ended();
+            AudioEvent::Ended { id } => match self.playing_with_load(id) {
+                // The engine already promoted its incoming deck, if any.
+                Some(QueueItemRef::Active(_)) => {
+                    self.promote_incoming(PlayLogReason::Completed, false);
                 }
-            }
+                Some(QueueItemRef::Incoming(_)) => self.incoming_ended(),
+                _ => {}
+            },
             AudioEvent::Failed { id, message } => {
-                if Some(id) == self.active_load {
-                    let affected = self.queue.active().map(|item| item.id.clone());
-                    self.fail_playback(message, affected);
-                } else if Some(id) == self.incoming_load {
-                    let affected = self.queue.incoming().map(|item| item.id.clone());
-                    self.fail_playback(message, affected);
+                if let Some(item) = self.playing_with_load(id) {
+                    let item_id = item.id().to_owned();
+                    self.fail_playback(message, Some(&item_id));
                 }
             }
             AudioEvent::CrossfadeComplete { outgoing, incoming } => {
-                if self.complete_after_fade
-                    && Some(outgoing) == self.active_load
-                    && Some(incoming) == self.incoming_load
+                if let Playback::Crossfading {
+                    active,
+                    incoming: playing,
+                    manual: true,
+                } = &self.queue.playback
+                    && active.load == Some(outgoing)
+                    && playing.load == Some(incoming)
                 {
-                    self.promote_incoming(PlayLogReason::Skipped, false);
+                    self.promote_incoming(PlayLogReason::Skipped, true);
                 }
             }
         }
-        self.take_effects()
     }
 
     /// Answer to [`Effect::Prepare`].
-    #[must_use]
     pub fn track_prepared(
         &mut self,
         request: RequestId,
         key: &TrackKey,
         result: Result<PathBuf, String>,
-    ) -> Vec<Effect> {
+    ) {
         if self.preparations.get(key) != Some(&Preparation::Pending(request)) {
-            return self.take_effects();
+            return;
         }
         match result {
             Ok(path) => {
                 self.preparations
                     .insert(key.clone(), Preparation::Ready(path));
-                self.set_key_readiness(key, Readiness::Ready);
                 self.resume_pending();
             }
             Err(message) => {
-                self.preparations.remove(key);
-                self.set_key_readiness(key, Readiness::Unavailable);
-                let pending_failed = self.pending.as_ref().is_some_and(|pending| {
+                self.preparations.insert(key.clone(), Preparation::Failed);
+                let pending = self.pending_item().filter(|id| {
                     self.queue
-                        .item(pending.item_id())
+                        .item(id)
                         .and_then(QueueItemRef::track)
                         .is_some_and(|track| &track.key() == key)
                 });
-                if pending_failed {
-                    let affected = self
-                        .pending
-                        .as_ref()
-                        .map(|pending| pending.item_id().to_owned());
-                    self.fail_playback(message, affected);
+                if let Some(item_id) = pending.map(str::to_owned) {
+                    self.fail_playback(message, Some(&item_id));
                 }
             }
         }
-        self.take_effects()
     }
 
     /// The local Library changed: local Tracks must be resolved again.
-    #[must_use]
-    pub fn library_changed(&mut self) -> Vec<Effect> {
+    pub fn library_changed(&mut self) {
         self.preparations
             .retain(|key, _| key.source != SourceId::Local);
-        for item in self.queue.queued_mut() {
-            if let ItemKind::Track(track) = &item.kind
-                && track.source == SourceId::Local
-            {
-                item.readiness = Readiness::Preparing;
-            }
-        }
-        self.prepare_queued_tracks();
-        self.take_effects()
+        self.prepare_upcoming();
     }
 
     /// Persistence or another service failed; show it to the DJ.
     pub fn report_error(&mut self, message: impl Into<String>) {
         self.playback_error = Some(message.into());
-    }
-
-    pub fn clear_error(&mut self) {
-        self.playback_error = None;
     }
 
     pub fn set_crossfade_seconds(&mut self, seconds: u32) {
@@ -516,25 +398,20 @@ impl Session {
     /// Startup: the result of reading the recovery file.
     pub fn recovery_loaded(&mut self, result: Result<Option<RecoverySnapshot>, String>) {
         match result {
-            Ok(Some(snapshot))
-                if snapshot.status == RecoveryStatus::Interrupted && !snapshot.queue.is_empty() =>
-            {
-                self.recovery = RecoveryState::Pending(snapshot);
+            Ok(snapshot) => {
+                self.recovery = snapshot.filter(|snapshot| {
+                    snapshot.status == RecoveryStatus::Interrupted && !snapshot.queue.is_empty()
+                });
             }
-            Ok(_) => self.recovery = RecoveryState::None,
             Err(message) => {
-                self.recovery = RecoveryState::None;
                 self.playback_error = Some(format!("Queue recovery could not be read: {message}"));
             }
         }
     }
 
-    #[must_use]
-    pub fn restore_recovery(&mut self) -> Vec<Effect> {
-        let RecoveryState::Pending(snapshot) =
-            std::mem::replace(&mut self.recovery, RecoveryState::None)
-        else {
-            return self.take_effects();
+    pub fn restore_recovery(&mut self) {
+        let Some(snapshot) = self.recovery.take() else {
+            return;
         };
         if let Some(started) = snapshot
             .session_started_at
@@ -543,73 +420,51 @@ impl Session {
         {
             self.session_started_at = started.with_timezone(&Utc);
         }
-        let queued = snapshot
-            .queue
-            .into_iter()
-            .map(|item| match item {
-                StoredQueueItem::Track { id, track } => UpcomingItem::track(id, track),
-                StoredQueueItem::Break { id } => UpcomingItem::new_break(id),
-            })
-            .collect();
-        self.replace_queue(Queue::Stopped { queued });
-        self.take_effects()
+        self.queue = Queue::stopped(snapshot.queue);
+        self.queue_changed();
     }
 
     /// "Start Empty": a new Session with an empty Queue.
-    #[must_use]
-    pub fn discard_recovery(&mut self) -> Vec<Effect> {
-        self.recovery = RecoveryState::None;
+    pub fn discard_recovery(&mut self) {
+        self.recovery = None;
         self.effects.push(Effect::DiscardRecovery);
         self.effects.push(Effect::ProtectTracks(Vec::new()));
         self.queue = Queue::default();
         self.session_started_at = (self.clock)();
-        self.take_effects()
     }
 
-    /// Startup: merge stored entries with any recorded since launch.
+    /// Startup: the stored Play Log, newest first.
     pub fn play_log_loaded(&mut self, result: Result<Vec<PlayLogEntry>, String>) {
         match result {
-            Ok(entries) => {
-                let mut merged: HashMap<String, PlayLogEntry> = entries
-                    .into_iter()
-                    .map(|entry| (entry.id.clone(), entry))
-                    .collect();
-                for entry in self.play_log.drain(..) {
-                    merged.insert(entry.id.clone(), entry);
-                }
-                let mut entries: Vec<_> = merged.into_values().collect();
-                entries.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-                self.play_log = entries;
-            }
+            Ok(entries) => self.play_log = entries,
             Err(message) => {
                 self.playback_error = Some(format!("Play log could not be read: {message}"));
             }
         }
     }
 
-    #[must_use]
-    pub fn clear_play_log(&mut self) -> Vec<Effect> {
+    /// Forgets the in-memory Play Log; the caller deletes the stored one.
+    pub fn clear_play_log(&mut self) {
         self.play_log.clear();
-        self.effects.push(Effect::ClearPlayLog);
-        self.take_effects()
     }
 
     /// Stops audio, closes Playing log entries, and saves a clean snapshot.
-    #[must_use]
-    pub fn shutdown(&mut self) -> Vec<Effect> {
-        self.finish_participants(PlayLogReason::Skipped);
-        self.stop_audio();
-        let queued = self.queue.items().map(requeue).collect();
-        self.queue = Queue::Stopped { queued };
+    pub fn shutdown(&mut self) {
+        self.stop_and_requeue(PlayLogReason::Skipped);
         let snapshot = self.snapshot(RecoveryStatus::Clean);
         self.effects.push(Effect::SaveRecovery(snapshot));
-        self.take_effects()
     }
 
     // ---- Internals ---------------------------------------------------------
 
-    fn take_effects(&mut self) -> Vec<Effect> {
-        std::mem::take(&mut self.effects)
+    fn audio(&mut self, command: AudioCommand) {
+        self.effects.push(Effect::Audio(command));
+    }
+
+    fn new_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
     }
 
     fn now(&self) -> String {
@@ -626,74 +481,47 @@ impl Session {
         }
     }
 
-    fn update_queue(&mut self, command: QueueCommand) {
-        let next = edit_queue(&self.queue, command);
-        if next != self.queue {
-            self.replace_queue(next);
+    fn edit(&mut self, edit: impl FnOnce(&mut Queue)) {
+        let before = self.queue.upcoming.clone();
+        edit(&mut self.queue);
+        if self.queue.upcoming != before {
+            self.queue_changed();
         }
     }
 
-    /// Every structural Queue change goes through here: protect, save, prepare.
-    fn replace_queue(&mut self, queue: Queue) {
-        self.queue = queue;
+    /// Every structural Queue change ends here: protect, save, prepare.
+    fn queue_changed(&mut self) {
         let tracks: Vec<Track> = self.queue.tracks().cloned().collect();
-        let keep: std::collections::HashSet<TrackKey> = tracks.iter().map(Track::key).collect();
+        let keep: HashSet<TrackKey> = tracks.iter().map(Track::key).collect();
         self.preparations.retain(|key, _| keep.contains(key));
         self.effects.push(Effect::ProtectTracks(tracks));
         let snapshot = self.snapshot(RecoveryStatus::Interrupted);
         self.effects.push(Effect::SaveRecovery(snapshot));
-        self.prepare_queued_tracks();
+        self.prepare_upcoming();
     }
 
-    fn prepare_queued_tracks(&mut self) {
-        let mut requests = Vec::new();
-        for item in self.queue.queued_mut() {
-            let ItemKind::Track(track) = &item.kind else {
-                continue;
-            };
-            if item.readiness != Readiness::Preparing {
-                continue;
-            }
+    /// Requests every Upcoming Track that has no preparation yet.
+    fn prepare_upcoming(&mut self) {
+        for track in self.queue.upcoming.iter().filter_map(QueueItem::as_track) {
             let key = track.key();
-            match self.preparations.get(&key) {
-                Some(Preparation::Ready(_)) => item.readiness = Readiness::Ready,
-                Some(Preparation::Pending(_)) => {}
-                None => {
-                    let request = self.next_request;
-                    self.next_request += 1;
-                    self.preparations.insert(key, Preparation::Pending(request));
-                    requests.push(Effect::Prepare {
-                        request,
-                        track: track.clone(),
-                    });
-                }
+            if self.preparations.contains_key(&key) {
+                continue;
             }
-        }
-        self.effects.extend(requests);
-    }
-
-    fn set_readiness(&mut self, item_id: &str, readiness: Readiness) {
-        if let Some(item) = self
-            .queue
-            .queued_mut()
-            .iter_mut()
-            .find(|item| item.id == item_id)
-        {
-            item.readiness = readiness;
-        }
-        if readiness == Readiness::Preparing {
-            self.prepare_queued_tracks();
+            let request = self.next_id;
+            self.next_id += 1;
+            self.preparations.insert(key, Preparation::Pending(request));
+            self.effects.push(Effect::Prepare {
+                request,
+                track: track.clone(),
+            });
         }
     }
 
-    fn set_key_readiness(&mut self, key: &TrackKey, readiness: Readiness) {
-        for item in self.queue.queued_mut() {
-            if let ItemKind::Track(track) = &item.kind
-                && &track.key() == key
-                && item.readiness == Readiness::Preparing
-            {
-                item.readiness = readiness;
-            }
+    /// Re-resolves a Track whose preparation failed, rather than giving up.
+    fn retry_if_failed(&mut self, key: &TrackKey) {
+        if self.preparations.get(key) == Some(&Preparation::Failed) {
+            self.preparations.remove(key);
+            self.prepare_upcoming();
         }
     }
 
@@ -705,211 +533,234 @@ impl Session {
         }
     }
 
-    fn new_load(&mut self) -> LoadId {
-        let id = self.next_load;
-        self.next_load += 1;
-        id
+    fn active_track_playing(&self) -> bool {
+        matches!(&self.queue.playback, Playback::Playing { active, .. } if active.load.is_some())
     }
 
-    fn stop_audio(&mut self) {
-        self.effects.push(Effect::Audio(AudioCommand::Stop));
-        self.active_load = None;
-        self.incoming_load = None;
-        self.pending = None;
-        self.crossfade_requested = false;
-        self.complete_after_fade = false;
+    fn playing_with_load(&self, load: LoadId) -> Option<QueueItemRef<'_>> {
+        self.queue.items().find(|item| match item {
+            QueueItemRef::Active(playing) | QueueItemRef::Incoming(playing) => {
+                playing.load == Some(load)
+            }
+            QueueItemRef::Upcoming(_) => false,
+        })
+    }
+
+    /// The Upcoming item a start or manual crossfade is waiting for.
+    fn pending_item(&self) -> Option<&str> {
+        match &self.queue.playback {
+            Playback::Stopped { starting: pending }
+            | Playback::Playing {
+                crossfade_to: pending,
+                ..
+            } => pending.as_deref(),
+            Playback::Crossfading { .. } => None,
+        }
+    }
+
+    /// Ends playback: closes the Playing items' log entries and stops the
+    /// engine. Returns the items that were Playing.
+    fn stop(&mut self, reason: PlayLogReason) -> Vec<QueueItem> {
+        let playing = match std::mem::take(&mut self.queue.playback) {
+            Playback::Stopped { .. } => vec![],
+            Playback::Playing { active, .. } => vec![active],
+            Playback::Crossfading {
+                active, incoming, ..
+            } => vec![active, incoming],
+        };
+        for item in &playing {
+            self.finish_log(&item.item.id, reason);
+        }
+        self.audio(AudioCommand::Stop);
+        playing.into_iter().map(|playing| playing.item).collect()
+    }
+
+    /// Stops, putting the Playing items back in front of the Upcoming ones.
+    fn stop_and_requeue(&mut self, reason: PlayLogReason) {
+        let items = self.stop(reason);
+        self.queue.upcoming.splice(0..0, items);
     }
 
     /// Stops everything and starts `item_id`, dropping the items before it.
     fn restart_from(&mut self, item_id: &str) {
-        let Some(index) = self.queue.index_of(item_id) else {
+        let Some(index) = self
+            .queue
+            .upcoming
+            .iter()
+            .position(|item| item.id == item_id)
+        else {
             return;
         };
-        let queued: Vec<UpcomingItem> = self.queue.items().skip(index).map(requeue).collect();
-        self.finish_participants(PlayLogReason::Skipped);
-        self.stop_audio();
-        self.replace_queue(Queue::Stopped { queued });
+        self.stop(PlayLogReason::Skipped);
+        self.queue.upcoming.drain(..index);
+        self.queue_changed();
         self.start_item(item_id);
     }
 
-    /// Starts an Upcoming item as the Active Item (stopped Queue assumed).
+    /// Starts an Upcoming item as the Active Item (stopped Queue assumed),
+    /// or waits for its Track to be prepared.
     fn start_item(&mut self, item_id: &str) {
-        let Some(QueueItemRef::Upcoming(item)) = self.queue.item(item_id) else {
+        let Some(item) = self.queue.upcoming.iter().find(|item| item.id == item_id) else {
             return;
         };
-        match item.kind {
-            ItemKind::Break => {
-                self.stop_audio();
-                self.become_active(item_id, None);
+        let Some(key) = item.as_track().map(Track::key) else {
+            self.audio(AudioCommand::Stop);
+            self.become_active(item_id, None);
+            return;
+        };
+        match self.ready_path(item_id) {
+            Some(path) => {
+                let load = self.new_id();
+                self.audio(AudioCommand::Play { id: load, path });
+                self.become_active(item_id, Some(load));
             }
-            ItemKind::Track(_) => match self.ready_path(item_id) {
-                Some(path) => {
-                    let load = self.new_load();
-                    self.effects
-                        .push(Effect::Audio(AudioCommand::Play { id: load, path }));
-                    self.become_active(item_id, Some(load));
-                }
-                None => {
-                    self.set_readiness(item_id, Readiness::Preparing);
-                    self.pending = Some(PendingStart::Play {
-                        item_id: item_id.to_owned(),
-                    });
-                }
-            },
+            None => {
+                self.retry_if_failed(&key);
+                self.queue.playback = Playback::Stopped {
+                    starting: Some(item_id.to_owned()),
+                };
+            }
         }
     }
 
     fn become_active(&mut self, item_id: &str, load: Option<LoadId>) {
-        let mut queued = self.queue.queued().to_vec();
-        let Some(position) = queued.iter().position(|item| item.id == item_id) else {
+        let Some(position) = self
+            .queue
+            .upcoming
+            .iter()
+            .position(|item| item.id == item_id)
+        else {
             return;
         };
-        let item = queued.remove(position);
-        // Starting from a stopped Queue keeps everything before it already removed.
-        self.queue = Queue::Playing {
-            active: playing(item),
-            queued,
-        };
-        self.active_load = load;
-        self.incoming_load = None;
-        self.crossfade_requested = false;
-        self.complete_after_fade = false;
-        self.pending = None;
+        let item = self.queue.upcoming.remove(position);
+        self.queue.playback = Playback::playing(PlayingItem::new(item, load));
         self.start_log(item_id);
     }
 
-    /// Manual crossfade from the active Track into `item_id`, which moves to the front.
+    /// Manual crossfade from the active Track into `item_id`, which moves to
+    /// the front and starts once it is prepared.
     fn crossfade_to(&mut self, item_id: &str) {
-        let Queue::Playing { active, queued } = &self.queue else {
+        let Some(position) = self
+            .queue
+            .upcoming
+            .iter()
+            .position(|item| item.id == item_id)
+        else {
             return;
         };
-        if !matches!(active.kind, ItemKind::Track(_)) {
-            return;
-        }
-        let mut queued = queued.clone();
-        let Some(position) = queued.iter().position(|item| item.id == item_id) else {
+        let Playback::Playing { crossfade_to, .. } = &mut self.queue.playback else {
             return;
         };
-        let target = queued.remove(position);
-        queued.insert(0, target);
-        let active_id = active.id.clone();
-        let active = active.clone();
-        self.replace_queue(Queue::Playing { active, queued });
-        self.pending = Some(PendingStart::Crossfade {
-            active_id,
-            item_id: item_id.to_owned(),
-        });
+        *crossfade_to = Some(item_id.to_owned());
+        let target = self.queue.upcoming.remove(position);
+        self.queue.upcoming.insert(0, target);
+        self.queue_changed();
         self.resume_pending();
     }
 
-    /// Starts the pending start or crossfade once its Track is ready.
+    /// Starts the pending start or crossfade once its Track is ready, and
+    /// forgets it if its item was removed.
     fn resume_pending(&mut self) {
-        let Some(pending) = self.pending.clone() else {
+        let Some(item_id) = self.pending_item().map(str::to_owned) else {
             return;
         };
-        let Some(path) = self.ready_path(pending.item_id()) else {
-            if self.queue.item(pending.item_id()).is_none() {
-                self.pending = None;
-            }
-            return;
-        };
-        match pending {
-            PendingStart::Play { item_id } => {
-                if !self.queue.is_stopped() {
-                    self.pending = None;
-                    return;
-                }
-                let load = self.new_load();
-                self.effects
-                    .push(Effect::Audio(AudioCommand::Play { id: load, path }));
+        match self.ready_path(&item_id) {
+            Some(path) if self.queue.is_stopped() => {
+                let load = self.new_id();
+                self.audio(AudioCommand::Play { id: load, path });
                 self.become_active(&item_id, Some(load));
             }
-            PendingStart::Crossfade { active_id, item_id } => {
-                self.pending = None;
-                if self.queue.active().map(|active| active.id.as_str()) != Some(active_id.as_str())
-                    || self.queue.is_crossfading()
+            Some(path) => self.begin_crossfade(&item_id, path, true),
+            None if self.queue.item(&item_id).is_none() => {
+                if let Playback::Stopped { starting: pending }
+                | Playback::Playing {
+                    crossfade_to: pending,
+                    ..
+                } = &mut self.queue.playback
                 {
-                    return;
+                    *pending = None;
                 }
-                self.begin_crossfade(&item_id, path, true);
             }
+            None => {}
         }
     }
 
     fn begin_crossfade(&mut self, item_id: &str, path: PathBuf, manual: bool) {
-        let Queue::Playing { active, queued } = &self.queue else {
+        let Some(position) = self
+            .queue
+            .upcoming
+            .iter()
+            .position(|item| item.id == item_id)
+        else {
             return;
         };
-        let (active, mut queued) = (active.clone(), queued.clone());
-        let Some(position) = queued.iter().position(|item| item.id == item_id) else {
+        let Playback::Playing { active, .. } = &self.queue.playback else {
             return;
         };
-        let incoming = queued.remove(position);
-        let load = self.new_load();
-        self.effects.push(Effect::Audio(AudioCommand::Crossfade {
+        let active = active.clone();
+        let incoming = self.queue.upcoming.remove(position);
+        let load = self.new_id();
+        self.audio(AudioCommand::Crossfade {
             id: load,
             path,
             duration_seconds: self.crossfade_seconds,
-        }));
-        self.queue = Queue::Crossfading {
+        });
+        self.queue.playback = Playback::Crossfading {
             active,
-            incoming: playing(incoming),
-            queued,
+            incoming: PlayingItem::new(incoming, Some(load)),
+            manual,
         };
-        self.incoming_load = Some(load);
-        self.complete_after_fade = manual;
         self.start_log(item_id);
     }
 
-    fn on_progress(&mut self, id: LoadId, position: f64, duration: Option<f64>) {
+    fn on_progress(&mut self, load: LoadId, position: f64, duration: Option<f64>) {
         let progress = PlaybackProgress {
             current_time: position,
             duration: duration
                 .filter(|value| value.is_finite() && *value > 0.0)
                 .unwrap_or(0.0),
         };
-        if Some(id) == self.incoming_load {
-            if let Queue::Crossfading { incoming, .. } = &mut self.queue {
-                incoming.progress = progress;
-            }
-            return;
-        }
-        if Some(id) != self.active_load {
-            return;
-        }
-        match &mut self.queue {
-            Queue::Playing { active, .. } | Queue::Crossfading { active, .. } => {
-                active.progress = progress
-            }
-            Queue::Stopped { .. } => return,
-        }
         let crossfade = f64::from(self.crossfade_seconds);
-        if !self.crossfade_requested
-            && crossfade > 0.0
+        let near_end = crossfade > 0.0
             && progress.duration > 0.0
             && position > 0.0
-            && progress.duration - position <= crossfade
-        {
-            self.crossfade_requested = true;
-            self.on_approaching_end();
+            && progress.duration - position <= crossfade;
+        let mut try_auto_crossfade = false;
+        match &mut self.queue.playback {
+            Playback::Stopped { .. } => {}
+            Playback::Playing {
+                active,
+                crossfade_to,
+                auto_crossfade_tried,
+            } => {
+                if active.load == Some(load) {
+                    active.progress = progress;
+                    if near_end && !*auto_crossfade_tried {
+                        *auto_crossfade_tried = true;
+                        try_auto_crossfade = crossfade_to.is_none();
+                    }
+                }
+            }
+            Playback::Crossfading {
+                active, incoming, ..
+            } => {
+                for item in [active, incoming] {
+                    if item.load == Some(load) {
+                        item.progress = progress;
+                    }
+                }
+            }
+        }
+        if try_auto_crossfade {
+            self.auto_crossfade();
         }
     }
 
-    /// Automatic crossfade into an adjacent, ready Track.
-    fn on_approaching_end(&mut self) {
-        if self.queue.is_crossfading() || self.pending.is_some() {
-            return;
-        }
-        let Queue::Playing { active, queued } = &self.queue else {
+    /// Crossfades into the next item if it is an adjacent, ready Track.
+    fn auto_crossfade(&mut self) {
+        let Some(next) = self.queue.upcoming.first() else {
             return;
         };
-        if !matches!(active.kind, ItemKind::Track(_)) {
-            return;
-        }
-        let Some(next) = queued.first() else { return };
-        if !matches!(next.kind, ItemKind::Track(_)) || next.readiness != Readiness::Ready {
-            return;
-        }
         let next_id = next.id.clone();
         if let Some(path) = self.ready_path(&next_id) {
             self.begin_crossfade(&next_id, path, false);
@@ -917,70 +768,53 @@ impl Session {
     }
 
     /// The outgoing Track leaves; the Incoming Track becomes the Active Item.
-    fn promote_incoming(&mut self, reason: PlayLogReason, engine_already_promoted: bool) {
-        let Queue::Crossfading {
-            active,
-            incoming,
-            queued,
-        } = &self.queue
+    fn promote_incoming(&mut self, reason: PlayLogReason, tell_engine: bool) {
+        let Playback::Crossfading {
+            active, incoming, ..
+        } = &self.queue.playback
         else {
             self.advance(reason);
             return;
         };
-        let (active_id, incoming, queued) = (active.id.clone(), incoming.clone(), queued.clone());
-        if !engine_already_promoted && let Some(load) = self.incoming_load {
-            self.effects
-                .push(Effect::Audio(AudioCommand::PromoteIncoming {
-                    incoming: load,
-                }));
+        let (active_id, incoming) = (active.item.id.clone(), incoming.clone());
+        if tell_engine && let Some(load) = incoming.load {
+            self.audio(AudioCommand::PromoteIncoming { incoming: load });
         }
         self.finish_log(&active_id, reason);
-        self.active_load = self.incoming_load.take();
-        self.crossfade_requested = false;
-        self.complete_after_fade = false;
-        self.replace_queue(Queue::Playing {
-            active: incoming,
-            queued,
-        });
+        self.queue.playback = Playback::playing(incoming);
+        self.queue_changed();
     }
 
     /// The Incoming Track ended before the outgoing one (a very short Track).
     fn incoming_ended(&mut self) {
-        let Queue::Crossfading {
-            active,
-            incoming,
-            queued,
-        } = &self.queue
+        let Playback::Crossfading {
+            active, incoming, ..
+        } = &self.queue.playback
         else {
             return;
         };
-        let (active, incoming_id, queued) = (active.clone(), incoming.id.clone(), queued.clone());
+        let (active, incoming_id) = (active.clone(), incoming.item.id.clone());
         self.finish_log(&incoming_id, PlayLogReason::Completed);
-        self.incoming_load = None;
-        self.complete_after_fade = false;
-        self.crossfade_requested = false;
-        self.replace_queue(Queue::Playing { active, queued });
+        self.queue.playback = Playback::playing(active);
+        self.queue_changed();
     }
 
     /// The Active Item left: start the next item, stopping at a Break or an unready Track.
     fn advance(&mut self, reason: PlayLogReason) {
         if let Some(active) = self.queue.active() {
-            let active_id = active.id.clone();
+            let active_id = active.item.id.clone();
             self.finish_log(&active_id, reason);
         }
-        self.active_load = None;
-        self.incoming_load = None;
-        self.pending = None;
-        self.crossfade_requested = false;
-        self.complete_after_fade = false;
-        let remaining: Vec<UpcomingItem> = self.queue.items().skip(1).map(requeue).collect();
-        self.replace_queue(Queue::Stopped { queued: remaining });
-        let Some(next) = self.queue.queued().first() else {
+        if let Playback::Crossfading { incoming, .. } = std::mem::take(&mut self.queue.playback) {
+            self.queue.upcoming.insert(0, incoming.item);
+        }
+        self.queue_changed();
+        let Some(next) = self.queue.upcoming.first() else {
             return;
         };
         let next_id = next.id.clone();
-        if let ItemKind::Track(track) = &next.kind
-            && next.readiness != Readiness::Ready
+        if let Some(track) = next.as_track()
+            && self.ready_path(&next_id).is_none()
         {
             self.playback_error = Some(format!(
                 "{} was not ready when the previous track ended.",
@@ -992,57 +826,31 @@ impl Session {
     }
 
     /// Stops all audio and reports `message`; the affected Track is marked unavailable.
-    fn fail_playback(&mut self, message: String, affected_item: Option<String>) {
-        self.finish_participants(PlayLogReason::Error);
-        self.stop_audio();
-        let queued: Vec<UpcomingItem> = self.queue.items().map(requeue).collect();
-        self.queue = Queue::Stopped { queued };
-        if let Some(item_id) = affected_item {
-            let track = self
-                .queue
-                .item(&item_id)
-                .and_then(QueueItemRef::track)
-                .cloned();
-            if let Some(track) = track {
-                self.preparations.remove(&track.key());
-                let mut event = DiagnosticEvent::new("playback")
-                    .source(track.source)
-                    .error(&message);
-                if track.source == SourceId::YoutubeMusic {
-                    event = event.video_id(&track.id);
-                }
-                self.effects.push(Effect::Diagnostic(event));
-                if let Some(item) = self
-                    .queue
-                    .queued_mut()
-                    .iter_mut()
-                    .find(|item| item.id == item_id)
-                {
-                    item.readiness = Readiness::Unavailable;
-                }
+    fn fail_playback(&mut self, message: String, affected_item: Option<&str>) {
+        self.stop_and_requeue(PlayLogReason::Error);
+        let track = affected_item
+            .and_then(|id| self.queue.item(id))
+            .and_then(QueueItemRef::track)
+            .cloned();
+        if let Some(track) = track {
+            self.preparations.insert(track.key(), Preparation::Failed);
+            let mut event = DiagnosticEvent::new("playback")
+                .source(track.source)
+                .error(&message);
+            if track.source == SourceId::YoutubeMusic {
+                event = event.video_id(&track.id);
             }
+            self.effects.push(Effect::Diagnostic(event));
         }
         self.playback_error = Some(message);
-    }
-
-    fn finish_participants(&mut self, reason: PlayLogReason) {
-        let ids: Vec<String> = self
-            .queue
-            .items()
-            .filter(|item| !item.is_upcoming())
-            .map(|item| item.id().to_owned())
-            .collect();
-        for id in ids {
-            self.finish_log(&id, reason);
-        }
     }
 
     fn start_log(&mut self, item_id: &str) {
         let Some(item) = self.queue.item(item_id) else {
             return;
         };
-        let stored = item.stored();
-        if let Some(track) = item.track()
+        let item = item.item().clone();
+        if let Some(track) = item.as_track()
             && track.source == SourceId::YoutubeMusic
         {
             self.effects
@@ -1050,7 +858,7 @@ impl Session {
         }
         let entry = PlayLogEntry {
             id: (self.ids)(),
-            item: stored,
+            item,
             started_at: self.now(),
             ended_at: None,
             reason: None,
@@ -1064,7 +872,7 @@ impl Session {
         let Some(entry) = self
             .play_log
             .iter_mut()
-            .find(|entry| entry.item.id() == item_id)
+            .find(|entry| entry.item.id == item_id)
         else {
             return;
         };

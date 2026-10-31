@@ -31,25 +31,9 @@ use std::time::Duration;
 use engine::{ControlMsg, Controller};
 use output::OutputOpener;
 
-/// Caller-chosen identifier for one load of a file.
-pub type LoadId = u64;
-
-/// Notifications from the engine, delivered on the engine's control thread.
-#[derive(Clone, Debug, PartialEq)]
-pub enum AudioEvent {
-    /// Periodic (~every 100 ms) while a deck with this id is loaded and playing.
-    Progress {
-        id: LoadId,
-        position_secs: f64,
-        duration_secs: Option<f64>,
-    },
-    /// The deck's audio has fully played out to the device.
-    Ended { id: LoadId },
-    /// The deck failed (file missing/undecodable, decode error mid-stream, output device lost).
-    Failed { id: LoadId, message: String },
-    /// A crossfade's gain ramps finished (outgoing is now silent, incoming at full gain).
-    CrossfadeComplete { outgoing: LoadId, incoming: LoadId },
-}
+/// The engine's notifications (delivered on its control thread) and the
+/// caller-chosen id of one load of a file, shared with the Session.
+pub use elizabeats_core::session::{AudioEvent, LoadId};
 
 /// Handle to the playback engine. Dropping it stops playback and joins all
 /// of the engine's threads.

@@ -34,18 +34,17 @@ fn mp3_bytes() -> Vec<u8> {
     frame.repeat(20)
 }
 
+fn write_file(path: &Path, bytes: Vec<u8>) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, bytes).unwrap();
+}
+
 fn write_wav(path: &Path) {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).unwrap();
-    }
-    fs::write(path, wav_bytes()).unwrap();
+    write_file(path, wav_bytes());
 }
 
 fn write_mp3(path: &Path) {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).unwrap();
-    }
-    fs::write(path, mp3_bytes()).unwrap();
+    write_file(path, mp3_bytes());
 }
 
 fn tag_file(path: &Path, edit: impl FnOnce(&mut Tag)) {
@@ -395,11 +394,7 @@ async fn reads_front_cover_artwork() {
     h.library.set_library_folder(Some(dir.path().to_path_buf()));
     h.library.rescan_and_wait().await;
 
-    let art = h.library.artwork("art.mp3").unwrap();
-    assert_eq!(art.mime, "image/jpeg");
-    assert_eq!(art.bytes, jpeg);
-    // Cached: the same allocation comes back.
-    assert!(Arc::ptr_eq(&art, &h.library.artwork("art.mp3").unwrap()));
+    assert_eq!(h.library.artwork("art.mp3"), Some(jpeg));
     assert!(h.library.artwork("plain.wav").is_none());
     assert!(h.library.artwork("missing.mp3").is_none());
 }

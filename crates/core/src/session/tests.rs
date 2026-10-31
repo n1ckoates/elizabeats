@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use chrono::{TimeZone, Utc};
 
 use super::*;
-use crate::queue::{QueueItemRef, Readiness};
+use crate::domain::QueueItem;
+use crate::queue::QueueItemRef;
 
 fn track(id: &str, source: SourceId, duration: Option<f64>) -> Track {
     Track {
@@ -67,20 +68,22 @@ impl Harness {
         self.clock.fetch_add(seconds, Ordering::SeqCst);
     }
 
-    fn record(&mut self, effects: Vec<Effect>) -> Vec<Effect> {
+    /// Takes the Session's queued effects, keeping a copy.
+    fn collect(&mut self) -> Vec<Effect> {
+        let effects = self.session.take_effects();
         self.effects.extend(effects.iter().cloned());
         effects
     }
 
     fn add(&mut self, track: Track) -> String {
-        let effects = self.session.add_track_to_end(track);
-        self.record(effects);
+        self.session.add_track_to_end(track);
+        self.collect();
         self.session.queue().items().last().unwrap().id().to_owned()
     }
 
     fn add_break(&mut self) -> String {
-        let effects = self.session.insert_break_at(usize::MAX);
-        self.record(effects);
+        self.session.insert_break_at(usize::MAX);
+        self.collect();
         self.session.queue().items().last().unwrap().id().to_owned()
     }
 
@@ -101,10 +104,9 @@ impl Harness {
                 return;
             }
             for (request, track) in pending {
-                let effects =
-                    self.session
-                        .track_prepared(request, &track.key(), Ok(path_for(&track)));
-                self.record(effects);
+                self.session
+                    .track_prepared(request, &track.key(), Ok(path_for(&track)));
+                self.collect();
             }
         }
     }
@@ -124,18 +126,18 @@ impl Harness {
     }
 
     fn play(&mut self, item_id: &str) {
-        let effects = self.session.play_item(item_id);
-        self.record(effects);
+        self.session.play_item(item_id);
+        self.collect();
     }
 
     fn skip(&mut self) {
-        let effects = self.session.skip();
-        self.record(effects);
+        self.session.skip();
+        self.collect();
     }
 
     fn audio(&mut self, event: AudioEvent) {
-        let effects = self.session.audio_event(event);
-        self.record(effects);
+        self.session.audio_event(event);
+        self.collect();
     }
 
     fn audio_commands(&self) -> Vec<AudioCommand> {
@@ -183,12 +185,15 @@ impl Harness {
     }
 
     fn active_id(&self) -> Option<String> {
-        self.session.queue().active().map(|item| item.id.clone())
+        self.session
+            .queue()
+            .active()
+            .map(|item| item.item.id.clone())
     }
 
     fn readiness(&self, item_id: &str) -> Option<Readiness> {
         match self.session.queue().item(item_id) {
-            Some(QueueItemRef::Upcoming(item)) => Some(item.readiness),
+            Some(item @ QueueItemRef::Upcoming(_)) => Some(self.session.readiness(item)),
             _ => None,
         }
     }
@@ -197,7 +202,7 @@ impl Harness {
         self.session
             .play_log()
             .iter()
-            .find(|entry| entry.item.id() == item_id)
+            .find(|entry| entry.item.id == item_id)
             .and_then(|entry| entry.reason)
     }
 
@@ -223,10 +228,9 @@ fn adding_tracks_prepares_once_per_track_and_never_plays() {
     );
     assert!(h.session.queue().is_stopped());
 
-    let effects = h
-        .session
+    h.session
         .track_prepared(1, &local("a").key(), Ok(PathBuf::from("/a")));
-    h.record(effects);
+    h.collect();
     assert_eq!(h.readiness(&a), Some(Readiness::Ready));
     assert_eq!(h.readiness(&a2), Some(Readiness::Ready));
     assert!(h.audio_commands().is_empty());
@@ -247,7 +251,7 @@ fn every_structural_change_saves_an_interrupted_snapshot() {
         .unwrap();
     assert_eq!(snapshot.status, RecoveryStatus::Interrupted);
     assert_eq!(snapshot.queue.len(), 1);
-    assert_eq!(snapshot.queue[0].id(), a);
+    assert_eq!(snapshot.queue[0].id, a);
     assert!(
         h.effects
             .iter()
@@ -286,7 +290,7 @@ fn play_starts_track_and_logs_it() {
     assert_eq!(h.session.play_log().len(), 1);
     assert!(h.session.play_log()[0].ended_at.is_none());
     assert!(h.effects.contains(&Effect::RecordYoutubePlay("a".into())));
-    assert!(h.session.needs_close_confirmation());
+    assert!(!h.session.queue().is_stopped());
 }
 
 #[test]
@@ -333,7 +337,10 @@ fn approaching_end_crossfades_into_adjacent_ready_track() {
     let load_b = h.last_crossfade_load();
     assert!(h.session.queue().is_crossfading());
     assert_eq!(
-        h.session.queue().incoming().map(|item| item.id.as_str()),
+        h.session
+            .queue()
+            .incoming()
+            .map(|item| item.item.id.as_str()),
         Some(b.as_str())
     );
     assert_eq!(
@@ -387,7 +394,7 @@ fn never_crossfades_across_a_break() {
         vec![AudioCommand::Stop],
         "a Break is silent"
     );
-    assert_eq!(h.session.play_log()[0].item.id(), br, "Break is logged");
+    assert_eq!(h.session.play_log()[0].item.id, br, "Break is logged");
 
     // Nothing advances past the Break until the DJ skips it.
     h.clear();
@@ -518,12 +525,11 @@ fn skip_waits_for_next_track_to_prepare() {
     assert_eq!(h.active_id().as_deref(), Some(a.as_str()));
 
     let (request, track) = prepares[0].clone();
-    let effects = h
-        .session
+    h.session
         .track_prepared(request, &track.key(), Ok(PathBuf::from("/b")));
-    h.record(effects);
+    h.collect();
     assert!(h.session.queue().is_crossfading());
-    assert_eq!(h.session.queue().incoming().unwrap().id, b);
+    assert_eq!(h.session.queue().incoming().unwrap().item.id, b);
 }
 
 #[test]
@@ -542,10 +548,9 @@ fn pending_skip_is_cancelled_when_active_ends_first() {
 
     h.clear();
     let (request, track) = prepares[0].clone();
-    let effects = h
-        .session
+    h.session
         .track_prepared(request, &track.key(), Ok(PathBuf::from("/b")));
-    h.record(effects);
+    h.collect();
     assert!(
         h.audio_commands().is_empty(),
         "late preparation must not start playback"
@@ -564,12 +569,12 @@ fn failed_manual_skip_stops_and_reports() {
     h.skip();
     h.clear();
     let (request, track) = prepares[0].clone();
-    let effects = h.session.track_prepared(
+    h.session.track_prepared(
         request,
         &track.key(),
         Err("YouTube download timed out.".into()),
     );
-    h.record(effects);
+    h.collect();
     assert!(h.session.queue().is_stopped());
     assert_eq!(
         h.session.playback_error(),
@@ -606,7 +611,7 @@ fn skipping_the_last_item_stops() {
     h.play(&a);
     h.skip();
     assert!(h.session.queue().is_empty());
-    assert!(!h.session.needs_close_confirmation());
+    assert!(!!h.session.queue().is_stopped());
     assert_eq!(h.log_reason(&a), Some(PlayLogReason::Skipped));
 }
 
@@ -672,22 +677,21 @@ fn failed_preparation_for_pending_start_reports_error() {
     let mut h = Harness::new();
     let a = h.add(local("a"));
     let prepares = h.take_prepares();
-    let effects = h
-        .session
+    h.session
         .track_prepared(prepares[0].0, &prepares[0].1.key(), Err("gone".into()));
-    h.record(effects);
+    h.collect();
     assert_eq!(h.readiness(&a), Some(Readiness::Unavailable));
     // Unavailable Tracks can be retried with Play now.
     h.clear();
     h.play(&a);
     let prepares = h.take_prepares();
     assert_eq!(prepares.len(), 1);
-    let effects = h.session.track_prepared(
+    h.session.track_prepared(
         prepares[0].0,
         &prepares[0].1.key(),
         Err("still gone".into()),
     );
-    h.record(effects);
+    h.collect();
     assert_eq!(h.session.playback_error(), Some("still gone"));
     assert!(h.session.queue().is_stopped());
     assert!(
@@ -790,7 +794,8 @@ fn breaks_cannot_be_inserted_between_crossfading_tracks() {
     let load = h.last_play_load();
     h.progress(load, 178.0, 180.0);
     let before = h.ids();
-    let effects = h.session.insert_break_at(1);
+    h.session.insert_break_at(1);
+    let effects = h.collect();
     assert!(effects.is_empty());
     assert_eq!(h.ids(), before);
 }
@@ -801,19 +806,17 @@ fn removing_a_pending_start_cancels_it() {
     let a = h.add(yt("a"));
     let prepares = h.take_prepares();
     // Make it unavailable, then retry so a start is pending.
-    let effects = h
-        .session
+    h.session
         .track_prepared(prepares[0].0, &prepares[0].1.key(), Err("x".into()));
-    h.record(effects);
+    h.collect();
     h.play(&a);
     let prepares = h.take_prepares();
-    let effects = h.session.remove_items(std::slice::from_ref(&a));
-    h.record(effects);
+    h.session.remove_items(std::slice::from_ref(&a));
+    h.collect();
     h.clear();
-    let effects =
-        h.session
-            .track_prepared(prepares[0].0, &prepares[0].1.key(), Ok(PathBuf::from("/a")));
-    h.record(effects);
+    h.session
+        .track_prepared(prepares[0].0, &prepares[0].1.key(), Ok(PathBuf::from("/a")));
+    h.collect();
     assert!(h.audio_commands().is_empty());
     assert!(h.session.queue().is_empty());
 }
@@ -823,20 +826,18 @@ fn stale_preparation_results_are_ignored() {
     let mut h = Harness::new();
     let a = h.add(local("a"));
     let first = h.take_prepares();
-    let effects = h.session.library_changed();
-    h.record(effects);
+    h.session.library_changed();
+    h.collect();
     let second = h.take_prepares();
     assert_eq!(second.len(), 1);
     assert_ne!(first[0].0, second[0].0);
-    let effects = h
-        .session
+    h.session
         .track_prepared(first[0].0, &first[0].1.key(), Err("old".into()));
-    h.record(effects);
+    h.collect();
     assert_eq!(h.readiness(&a), Some(Readiness::Preparing));
-    let effects =
-        h.session
-            .track_prepared(second[0].0, &second[0].1.key(), Ok(PathBuf::from("/a")));
-    h.record(effects);
+    h.session
+        .track_prepared(second[0].0, &second[0].1.key(), Ok(PathBuf::from("/a")));
+    h.collect();
     assert_eq!(h.readiness(&a), Some(Readiness::Ready));
 }
 
@@ -847,8 +848,8 @@ fn library_change_reprepares_only_local_tracks() {
     let y = h.add(yt("y"));
     h.prepare_all();
     h.clear();
-    let effects = h.session.library_changed();
-    h.record(effects);
+    h.session.library_changed();
+    h.collect();
     let prepares = h.take_prepares();
     assert_eq!(prepares.len(), 1);
     assert_eq!(prepares[0].1.id, "a");
@@ -863,19 +864,16 @@ fn recovery_restore_and_discard() {
         version: 1,
         status: RecoveryStatus::Interrupted,
         queue: vec![
-            StoredQueueItem::Track {
-                id: "q1".into(),
-                track: local("a"),
-            },
-            StoredQueueItem::Break { id: "q2".into() },
+            QueueItem::track("q1", local("a")),
+            QueueItem::new_break("q2"),
         ],
         session_started_at: Some("2026-01-02T03:04:05.000Z".into()),
         updated_at: "2026-01-02T04:00:00.000Z".into(),
     };
     h.session.recovery_loaded(Ok(Some(snapshot.clone())));
-    assert!(matches!(h.session.recovery(), RecoveryState::Pending(_)));
-    let effects = h.session.restore_recovery();
-    h.record(effects);
+    assert!(h.session.pending_recovery().is_some());
+    h.session.restore_recovery();
+    h.collect();
     assert_eq!(h.ids(), vec!["q1".to_owned(), "q2".to_owned()]);
     assert_eq!(h.readiness("q1"), Some(Readiness::Preparing));
     assert!(
@@ -890,22 +888,23 @@ fn recovery_restore_and_discard() {
 
     let mut h = Harness::new();
     h.session.recovery_loaded(Ok(Some(snapshot.clone())));
-    let effects = h.session.discard_recovery();
+    h.session.discard_recovery();
+    let effects = h.collect();
     assert!(effects.contains(&Effect::DiscardRecovery));
     assert!(h.session.queue().is_empty());
 
     let mut clean = snapshot.clone();
     clean.status = RecoveryStatus::Clean;
     h.session.recovery_loaded(Ok(Some(clean)));
-    assert_eq!(h.session.recovery(), &RecoveryState::None);
+    assert_eq!(h.session.pending_recovery(), None);
 
     let mut empty = snapshot;
     empty.queue.clear();
     h.session.recovery_loaded(Ok(Some(empty)));
-    assert_eq!(h.session.recovery(), &RecoveryState::None);
+    assert_eq!(h.session.pending_recovery(), None);
 
     h.session.recovery_loaded(Err("bad json".into()));
-    assert_eq!(h.session.recovery(), &RecoveryState::None);
+    assert_eq!(h.session.pending_recovery(), None);
     assert_eq!(
         h.session.playback_error(),
         Some("Queue recovery could not be read: bad json")
@@ -920,7 +919,8 @@ fn shutdown_closes_log_and_saves_clean_snapshot() {
     h.prepare_all();
     h.play(&a);
     h.clear();
-    let effects = h.session.shutdown();
+    h.session.shutdown();
+    let effects = h.collect();
     assert!(effects.contains(&Effect::Audio(AudioCommand::Stop)));
     let snapshot = effects
         .iter()
@@ -934,7 +934,7 @@ fn shutdown_closes_log_and_saves_clean_snapshot() {
         snapshot
             .queue
             .iter()
-            .map(StoredQueueItem::id)
+            .map(|item| item.id.as_str())
             .collect::<Vec<_>>(),
         vec![a.as_str(), b.as_str()]
     );
@@ -976,34 +976,38 @@ fn play_log_entries_are_saved_on_start_and_finish() {
 }
 
 #[test]
-fn play_log_loading_merges_with_entries_from_this_launch() {
+fn play_log_loads_and_clears() {
     let mut h = Harness::new();
-    let a = h.add(local("a"));
-    h.prepare_all();
-    h.play(&a);
-    let current = h.session.play_log()[0].clone();
     let older = PlayLogEntry {
         id: "old".into(),
-        item: StoredQueueItem::Break { id: "x".into() },
+        item: QueueItem::new_break("x"),
         started_at: "2020-01-01T00:00:00.000Z".into(),
         ended_at: Some("2020-01-01T00:01:00.000Z".into()),
         reason: Some(PlayLogReason::Skipped),
     };
     h.session.play_log_loaded(Ok(vec![older.clone()]));
-    assert_eq!(h.session.play_log(), &[current, older]);
-    let effects = h.session.clear_play_log();
-    assert_eq!(effects, vec![Effect::ClearPlayLog]);
+    assert_eq!(h.session.play_log(), &[older]);
+    h.session.clear_play_log();
+    assert!(h.collect().is_empty());
     assert!(h.session.play_log().is_empty());
+    h.session.play_log_loaded(Err("bad".into()));
+    assert_eq!(
+        h.session.playback_error(),
+        Some("Play log could not be read: bad")
+    );
 }
 
 #[test]
 fn insert_break_goes_above_the_selection_or_at_the_end() {
     let mut h = Harness::new();
     let is_break = |h: &Harness, id: &str| {
-        matches!(h.session.queue().item(id).unwrap().kind(), ItemKind::Break)
+        matches!(
+            h.session.queue().item(id).unwrap().kind(),
+            crate::domain::ItemKind::Break
+        )
     };
-    let effects = h.session.insert_break(None);
-    h.record(effects);
+    h.session.insert_break(None);
+    h.collect();
     assert_eq!(h.ids().len(), 1, "an empty Queue gets the Break");
     let a = h.add(local("a"));
     let b = h.add(local("b"));
@@ -1012,15 +1016,15 @@ fn insert_break_goes_above_the_selection_or_at_the_end() {
     h.play(&a);
 
     // Nothing selected: the end of the Queue, even while something plays.
-    let effects = h.session.insert_break(None);
-    h.record(effects);
+    h.session.insert_break(None);
+    h.collect();
     let ids = h.ids();
     assert_eq!(ids[1..4], [b.clone(), c.clone(), ids[3].clone()]);
     assert!(is_break(&h, &ids[3]));
 
     // `c` selected: right above it.
-    let effects = h.session.insert_break(Some(&c));
-    h.record(effects);
+    h.session.insert_break(Some(&c));
+    h.collect();
     let ids = h.ids();
     assert_eq!(ids[1], b);
     assert!(is_break(&h, &ids[2]));
@@ -1033,6 +1037,33 @@ fn active_log_entry_tracks_break_start_time() {
     let br = h.add_break();
     h.play(&br);
     let entry = h.session.active_log_entry().unwrap();
-    assert_eq!(entry.item.id(), br);
+    assert_eq!(entry.item.id, br);
     assert!(entry.ended_at.is_none());
+}
+
+#[test]
+fn insert_break_after_follows_the_item_but_never_splits_a_crossfade() {
+    let mut h = Harness::new();
+    let a = h.add(local("a"));
+    let b = h.add(local("b"));
+    h.prepare_all();
+    h.play(&a);
+    h.session.insert_break_after(&a);
+    h.session.insert_break_after("missing");
+    h.collect();
+    let ids = h.ids();
+    assert_eq!(ids.len(), 3);
+    assert_eq!((ids[0].as_str(), ids[2].as_str()), (a.as_str(), b.as_str()));
+    assert!(h.session.queue().upcoming[0].as_track().is_none());
+
+    let mut h = Harness::new();
+    let a = h.add(local("a"));
+    let b = h.add(local("b"));
+    h.prepare_all();
+    h.play(&a);
+    h.skip();
+    assert!(h.session.queue().is_crossfading());
+    h.session.insert_break_after(&a);
+    h.session.insert_break_after(&b);
+    assert_eq!(h.ids(), vec![a, b]);
 }

@@ -82,12 +82,10 @@ impl ArtworkCache {
             match job_key {
                 ArtKey::Local(id) => {
                     let library = services.library.clone();
-                    tokio::task::spawn_blocking(move || {
-                        library.artwork(&id).map(|art| art.bytes.clone())
-                    })
-                    .await
-                    .ok()
-                    .flatten()
+                    tokio::task::spawn_blocking(move || library.artwork(&id))
+                        .await
+                        .ok()
+                        .flatten()
                 }
                 ArtKey::Remote(url) => fetch_remote(&services.http, &url).await,
             }

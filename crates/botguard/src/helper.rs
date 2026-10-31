@@ -21,8 +21,7 @@
 //! - When stdin closes (the app quit or dropped us) the helper exits, so it
 //!   never outlives the app. The app kills it if it stops answering.
 
-use std::ffi::OsString;
-use std::io::{BufReader, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -34,8 +33,8 @@ use tao::window::{Window, WindowBuilder};
 use wry::{WebContext, WebView, WebViewBuilder};
 
 use crate::protocol::{
-    HelperReply, HelperRequest, ReplyOutcome, RequestAction, decode_line, encode_line, is_video_id,
-    read_bounded_line,
+    HelperReply, HelperRequest, ReplyOutcome, RequestAction, decode_line, encode_line,
+    for_each_line, is_video_id,
 };
 
 /// First argument that switches the executable into helper mode.
@@ -50,32 +49,18 @@ const PAGE_SCRIPT: &str = include_str!("../js/src/helper-page.js");
 /// page has not loaded and set itself up by then, e.g. when offline.
 const PAGE_READY_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Command line of a helper launch.
-#[derive(Debug, PartialEq, Eq)]
-struct HelperArgs {
-    /// Where the webview may keep its files (used by WebView2 on Windows).
-    data_dir: Option<PathBuf>,
-}
-
 /// Runs the webview minter when this process was started as the helper and
 /// returns its exit code. Returns `None` for a normal application launch.
 ///
 /// Call this first thing in `main`, before any UI is created: the helper
-/// needs the main thread for its own event loop.
+/// needs the main thread for its own event loop. The flag only counts as the
+/// first argument; the second, if any, is the webview's data folder.
 pub fn helper_main_if_requested() -> Option<i32> {
-    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let args = parse_args(&args)?;
-    Some(run(args))
-}
-
-/// Recognises helper launches; anything else is a normal app launch.
-fn parse_args(args: &[OsString]) -> Option<HelperArgs> {
-    if args.first()? != HELPER_FLAG {
+    let mut args = std::env::args_os().skip(1);
+    if args.next()? != HELPER_FLAG {
         return None;
     }
-    Some(HelperArgs {
-        data_dir: args.get(1).map(PathBuf::from),
-    })
+    Some(run(args.next().map(PathBuf::from)))
 }
 
 /// Messages the page sends through `window.ipc.postMessage`.
@@ -98,18 +83,15 @@ enum UserEvent {
     Page(String),
 }
 
-struct Helper {
-    /// `None` when the webview could not be created; requests then fail.
-    webview: Option<WebView>,
-    /// Why the helper cannot mint (setup failure or page timeout).
-    failure: Option<String>,
-    ready: bool,
-    /// Requests that arrived before the page was ready.
-    waiting: Vec<HelperRequest>,
-    started: Instant,
+/// The helper page in its webview. When the window or webview could not be
+/// created there is none (`Err` with the reason) and every request fails.
+struct Page {
+    webview: WebView,
+    /// Requests that arrived before the page was ready; `None` once it is.
+    waiting: Option<Vec<HelperRequest>>,
 }
 
-fn run(args: HelperArgs) -> i32 {
+fn run(data_dir: Option<PathBuf>) -> i32 {
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     #[cfg(target_os = "macos")]
     {
@@ -122,44 +104,32 @@ fn run(args: HelperArgs) -> i32 {
     spawn_stdin_reader(event_loop.create_proxy());
 
     // The window and context must outlive the webview, so they live here.
-    let mut web_context = WebContext::new(args.data_dir);
+    let mut web_context = WebContext::new(data_dir);
     let window = WindowBuilder::new()
         .with_title("Elizabeats PO token minter")
         .with_visible(false)
         .with_focused(false)
-        .build(&event_loop);
-    let (webview, failure) = match &window {
-        Ok(window) => match create_webview(window, &mut web_context, event_loop.create_proxy()) {
-            Ok(webview) => (Some(webview), None),
-            Err(error) => (
-                None,
-                Some(format!("could not create the system webview: {error}")),
-            ),
-        },
-        Err(error) => (
-            None,
-            Some(format!("could not create the helper window: {error}")),
-        ),
-    };
-    if let Some(failure) = &failure {
+        .build(&event_loop)
+        .map_err(|error| format!("could not create the helper window: {error}"));
+    let mut page = window
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|window| create_webview(window, &mut web_context, event_loop.create_proxy()))
+        .map(|webview| Page {
+            webview,
+            waiting: Some(Vec::new()),
+        });
+    if let Err(failure) = &page {
         eprintln!("{failure}");
     }
-    let mut helper = Helper {
-        webview,
-        failure,
-        ready: false,
-        waiting: Vec::new(),
-        started: Instant::now(),
-    };
 
+    let ready_deadline = Instant::now() + PAGE_READY_TIMEOUT;
     let code = event_loop.run_return(move |event, _, control_flow| {
-        if let Some(code) = helper.handle(event) {
-            *control_flow = ControlFlow::ExitWithCode(code);
-        } else if helper.ready {
-            *control_flow = ControlFlow::Wait;
-        } else {
-            *control_flow = ControlFlow::WaitUntil(helper.started + PAGE_READY_TIMEOUT);
-        }
+        *control_flow = match handle(&mut page, event) {
+            Some(code) => ControlFlow::ExitWithCode(code),
+            None if matches!(page, Ok(Page { waiting: None, .. })) => ControlFlow::Wait,
+            None => ControlFlow::WaitUntil(ready_deadline),
+        };
     });
     drop(window);
     code
@@ -191,15 +161,15 @@ fn create_webview(
         target_os = "netbsd",
         target_os = "openbsd"
     ))]
-    {
+    let built = {
         // WebKitGTK must be placed in a GTK container (works on X11 and Wayland).
         use tao::platform::unix::WindowExtUnix;
         use wry::WebViewBuilderExtUnix;
         let container = window
             .default_vbox()
             .ok_or("the helper window has no GTK container")?;
-        builder.build_gtk(container).map_err(|e| e.to_string())
-    }
+        builder.build_gtk(container)
+    };
     #[cfg(not(any(
         target_os = "linux",
         target_os = "dragonfly",
@@ -207,72 +177,71 @@ fn create_webview(
         target_os = "netbsd",
         target_os = "openbsd"
     )))]
-    {
-        builder.build(window).map_err(|e| e.to_string())
+    let built = builder.build(window);
+    built.map_err(|error| format!("could not create the system webview: {error}"))
+}
+
+/// Handles one event loop event; returns an exit code to stop.
+fn handle(page: &mut Result<Page, String>, event: Event<'_, UserEvent>) -> Option<i32> {
+    match (event, page) {
+        (Event::UserEvent(UserEvent::StdinClosed), _) => Some(0),
+        (Event::UserEvent(UserEvent::Request(request)), Err(failure)) => {
+            // Answer, then exit: the app starts a fresh helper next time.
+            send_reply(&error_reply(request.id, failure));
+            Some(1)
+        }
+        (Event::UserEvent(UserEvent::Request(request)), Ok(page)) => {
+            match &mut page.waiting {
+                Some(waiting) => waiting.push(request),
+                None => page.dispatch(&request),
+            }
+            None
+        }
+        (Event::UserEvent(UserEvent::Page(body)), Ok(page)) => page.on_message(&body),
+        (Event::NewEvents(StartCause::ResumeTimeReached { .. }), page) => {
+            let (failure, waiting) = match page {
+                Ok(Page { waiting: None, .. }) => return None,
+                Ok(Page {
+                    waiting: Some(waiting),
+                    ..
+                }) => (
+                    "YouTube did not load in the system webview (offline?)",
+                    std::mem::take(waiting),
+                ),
+                Err(failure) => (failure.as_str(), Vec::new()),
+            };
+            eprintln!("{failure}");
+            for request in waiting {
+                send_reply(&error_reply(request.id, failure));
+            }
+            Some(1)
+        }
+        _ => None,
     }
 }
 
-impl Helper {
-    /// Handles one event loop event; returns an exit code to stop.
-    fn handle(&mut self, event: Event<'_, UserEvent>) -> Option<i32> {
-        match event {
-            Event::UserEvent(UserEvent::Request(request)) => {
-                if let Some(failure) = self.failure.clone() {
-                    // Answer, then exit: the app starts a fresh helper next time.
-                    send_reply(&error_reply(request.id, &failure));
-                    return Some(1);
-                }
-                if self.ready {
-                    self.dispatch(&request);
-                } else {
-                    self.waiting.push(request);
-                }
-                None
-            }
-            Event::UserEvent(UserEvent::Page(body)) => self.on_page_message(&body),
-            Event::UserEvent(UserEvent::StdinClosed) => Some(0),
-            Event::NewEvents(StartCause::ResumeTimeReached { .. }) if !self.ready => {
-                let failure = self.failure.clone().unwrap_or_else(|| {
-                    "YouTube did not load in the system webview (offline?)".to_owned()
-                });
-                eprintln!("{failure}");
-                for request in self.waiting.drain(..) {
-                    send_reply(&error_reply(request.id, &failure));
-                }
-                Some(1)
-            }
-            _ => None,
-        }
-    }
-
-    fn on_page_message(&mut self, body: &str) -> Option<i32> {
-        match decode_line::<PageMessage>(body) {
-            Some(PageMessage::Ready) => {
-                self.ready = true;
-                for request in std::mem::take(&mut self.waiting) {
+impl Page {
+    fn on_message(&mut self, body: &str) -> Option<i32> {
+        match decode_line::<PageMessage>(body)? {
+            PageMessage::Ready => {
+                for request in self.waiting.take().unwrap_or_default() {
                     self.dispatch(&request);
                 }
                 None
             }
-            Some(PageMessage::Reply(reply)) => {
-                // Stdout is gone: the app has quit.
-                (!send_reply(&reply)).then_some(0)
-            }
-            Some(PageMessage::Log { message }) => {
+            // Stdout is gone: the app has quit.
+            PageMessage::Reply(reply) => (!send_reply(&reply)).then_some(0),
+            PageMessage::Log { message } => {
                 eprintln!("{message}");
                 None
             }
-            None => None,
         }
     }
 
     /// Starts the request in the page; the answer arrives as an IPC message.
     fn dispatch(&self, request: &HelperRequest) {
-        let Some(webview) = &self.webview else {
-            return;
-        };
         let result = page_call(request).and_then(|script| {
-            webview
+            self.webview
                 .evaluate_script(&script)
                 .map_err(|e| format!("could not run the page script: {e}"))
         });
@@ -286,20 +255,19 @@ impl Helper {
 /// passed as JSON, which is valid JavaScript, so they cannot inject code.
 fn page_call(request: &HelperRequest) -> Result<String, String> {
     let id = request.id;
-    match &request.action {
+    let call = match &request.action {
         RequestAction::Mint { identifiers } => serde_json::to_string(identifiers)
-            .map(|ids| format!("window.__elizabeatsMint({id}, {ids});"))
-            .map_err(|e| e.to_string()),
+            .map(|ids| format!("window.__elizabeatsMint({id}, {ids});")),
         RequestAction::Resolve { resolve } if is_video_id(resolve) => {
             serde_json::to_string(resolve)
                 .map(|video_id| format!("window.__elizabeatsResolve({id}, {video_id});"))
-                .map_err(|e| e.to_string())
         }
         RequestAction::Resolve { resolve } => {
             let shown: String = resolve.chars().take(40).collect();
-            Err(format!("invalid video ID {shown:?}"))
+            return Err(format!("invalid video ID {shown:?}"));
         }
-    }
+    };
+    call.map_err(|e| e.to_string())
 }
 
 fn error_reply(id: u64, message: &str) -> HelperReply {
@@ -324,31 +292,21 @@ fn send_reply(reply: &HelperReply) -> bool {
         .is_ok()
 }
 
-/// Reads request lines from stdin until it closes, then tells the event loop.
+/// Reads request lines from stdin until it closes (EOF or a broken pipe: the
+/// app is gone), then tells the event loop.
 fn spawn_stdin_reader(proxy: EventLoopProxy<UserEvent>) {
-    let spawned = std::thread::Builder::new()
-        .name("minter-stdin".into())
-        .spawn(move || {
-            let mut stdin = BufReader::new(std::io::stdin().lock());
-            let mut line = Vec::new();
-            loop {
-                line.clear();
-                match read_bounded_line(&mut stdin, &mut line) {
-                    Ok(true) => {}
-                    // EOF or a broken pipe: the app is gone.
-                    Ok(false) | Err(_) => break,
-                }
-                let text = String::from_utf8_lossy(&line);
-                let Some(request) = decode_line::<HelperRequest>(&text) else {
+    let spawned = crate::spawn_thread("minter-stdin", move || {
+        for_each_line(std::io::stdin().lock(), |line| {
+            match decode_line::<HelperRequest>(line) {
+                Some(request) => proxy.send_event(UserEvent::Request(request)).is_ok(),
+                None => {
                     eprintln!("ignoring malformed request line");
-                    continue;
-                };
-                if proxy.send_event(UserEvent::Request(request)).is_err() {
-                    return;
+                    true
                 }
             }
-            let _ = proxy.send_event(UserEvent::StdinClosed);
         });
+        let _ = proxy.send_event(UserEvent::StdinClosed);
+    });
     if let Err(error) = spawned {
         eprintln!("could not start the stdin reader: {error}");
     }
@@ -358,53 +316,18 @@ fn spawn_stdin_reader(proxy: EventLoopProxy<UserEvent>) {
 mod tests {
     use super::*;
 
-    fn args(values: &[&str]) -> Vec<OsString> {
-        values.iter().map(OsString::from).collect()
-    }
-
-    #[test]
-    fn normal_launches_are_not_helper_calls() {
-        assert_eq!(parse_args(&[]), None);
-        assert_eq!(parse_args(&args(&["-psn_0_12345"])), None);
-        assert_eq!(parse_args(&args(&["--version"])), None);
-        assert_eq!(
-            parse_args(&args(&["--snapshot-file", "x", "--", "id"])),
-            None
-        );
-        // The flag only counts as the first argument.
-        assert_eq!(parse_args(&args(&["song.mp3", HELPER_FLAG])), None);
-    }
-
-    #[test]
-    fn helper_launches() {
-        assert_eq!(
-            parse_args(&args(&[HELPER_FLAG])),
-            Some(HelperArgs { data_dir: None })
-        );
-        assert_eq!(
-            parse_args(&args(&[HELPER_FLAG, "/data/webview"])),
-            Some(HelperArgs {
-                data_dir: Some("/data/webview".into())
-            })
-        );
-    }
-
     #[test]
     fn page_messages() {
+        let message = |line: &str| decode_line::<PageMessage>(line);
+        assert_eq!(message(r#"{"type":"ready"}"#), Some(PageMessage::Ready));
         assert_eq!(
-            decode_line::<PageMessage>(r#"{"type":"ready"}"#),
-            Some(PageMessage::Ready)
-        );
-        assert_eq!(
-            decode_line::<PageMessage>(r#"{"type":"log","message":"hi"}"#),
+            message(r#"{"type":"log","message":"hi"}"#),
             Some(PageMessage::Log {
                 message: "hi".into()
             })
         );
         assert_eq!(
-            decode_line::<PageMessage>(
-                r#"{"type":"reply","id":4,"tokens":["t"],"valid_until":1800000000}"#
-            ),
+            message(r#"{"type":"reply","id":4,"tokens":["t"],"valid_until":1800000000}"#),
             Some(PageMessage::Reply(HelperReply {
                 id: 4,
                 outcome: ReplyOutcome::Tokens {
@@ -414,35 +337,26 @@ mod tests {
             }))
         );
         assert_eq!(
-            decode_line::<PageMessage>(r#"{"type":"reply","id":5,"error":"nope"}"#),
+            message(r#"{"type":"reply","id":5,"error":"nope"}"#),
             Some(PageMessage::Reply(error_reply(5, "nope")))
         );
-        assert_eq!(decode_line::<PageMessage>(r#"{"type":"other"}"#), None);
-        assert_eq!(decode_line::<PageMessage>("not json"), None);
+        assert_eq!(message(r#"{"type":"other"}"#), None);
+        assert_eq!(message("not json"), None);
     }
 
     #[test]
-    fn stream_and_user_facing_replies_pass_through() {
-        let Some(PageMessage::Reply(reply)) = decode_line::<PageMessage>(
-            r#"{"type":"reply","id":6,"stream":{"url":"https://x/","mime_type":"audio/mp4","content_length":5,"bitrate":1,"itag":140,"user_agent":"UA"}}"#,
-        ) else {
-            panic!("not a reply");
-        };
-        assert_eq!(
-            reply.into_stream().unwrap().user_agent.as_deref(),
-            Some("UA")
-        );
-        let Some(PageMessage::Reply(reply)) = decode_line::<PageMessage>(
-            r#"{"type":"reply","id":7,"error":"Private video","user_facing":true}"#,
-        ) else {
-            panic!("not a reply");
-        };
-        // Forwarded to the app unchanged, flag included.
-        let line = encode_line(&reply).unwrap();
-        assert_eq!(
-            line,
-            b"{\"id\":7,\"error\":\"Private video\",\"user_facing\":true}\n"
-        );
+    fn replies_pass_through_unchanged() {
+        for reply in [
+            r#"{"id":6,"stream":{"url":"https://x/","mime_type":"audio/mp4","content_length":5,"bitrate":1,"itag":140,"user_agent":"UA"}}"#,
+            r#"{"id":7,"error":"Private video","user_facing":true}"#,
+        ] {
+            let typed = format!(r#"{{"type":"reply",{}"#, &reply[1..]);
+            let Some(PageMessage::Reply(parsed)) = decode_line::<PageMessage>(&typed) else {
+                panic!("not a reply: {typed}");
+            };
+            let line = encode_line(&parsed).unwrap();
+            assert_eq!(std::str::from_utf8(&line).unwrap(), format!("{reply}\n"));
+        }
     }
 
     #[test]

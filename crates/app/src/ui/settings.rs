@@ -1,8 +1,6 @@
 //! Settings, built on GPUI Kit's Settings component: a sidebar of pages
 //! (Library, Playback, Storage, Appearance, About), each with grouped items.
 
-use std::path::PathBuf;
-
 use elizabeats_core::format::format_bytes;
 use elizabeats_core::{AppSettings, Theme};
 use gpui_kit::assets::IconName as Lucide;
@@ -13,8 +11,8 @@ use gpui_kit::component::setting::{
 };
 use gpui_kit::component::{ActiveTheme, Disableable, IconName, Sizable, WindowExt, h_flex};
 use gpui_kit::{
-    App, Context, Entity, IntoElement, ParentElement, PathPromptOptions, Render, SharedString,
-    Styled, Subscription, WeakEntity, Window, div, px,
+    App, ClickEvent, Context, Entity, IntoElement, ParentElement, PathPromptOptions, Render,
+    SharedString, Styled, Subscription, WeakEntity, Window, div, px,
 };
 
 use super::AppView;
@@ -106,7 +104,7 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn choose_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn choose_folder(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -114,45 +112,74 @@ impl SettingsView {
             prompt: Some("Choose Library Folder".into()),
         });
         self.errors.library = None;
-        let _ = window;
         cx.spawn(async move |this, cx| {
-            let chosen: Option<PathBuf> = match paths.await {
-                Ok(Ok(Some(mut paths))) if !paths.is_empty() => Some(paths.remove(0)),
-                Ok(Err(error)) => {
-                    let _ = this.update(cx, |this, cx| {
-                        this.errors.library =
-                            Some(format!("Could not choose a library folder: {error}"));
-                        cx.notify();
-                    });
-                    None
+            let chosen = paths.await;
+            let _ = this.update(cx, |this, cx| match chosen {
+                Ok(Ok(Some(paths))) => {
+                    if let Some(folder) = paths.into_iter().next() {
+                        let folder = folder.to_string_lossy().into_owned();
+                        this.update(cx, move |settings| settings.library_folder = Some(folder));
+                    }
                 }
-                _ => None,
-            };
-            if let Some(folder) = chosen {
-                let _ = this.update(cx, |this, cx| {
-                    let folder = folder.to_string_lossy().into_owned();
-                    this.update(cx, move |settings| settings.library_folder = Some(folder));
-                });
-            }
+                Ok(Err(error)) => {
+                    this.errors.library =
+                        Some(format!("Could not choose a library folder: {error}"));
+                    cx.notify();
+                }
+                _ => {}
+            });
         })
         .detach();
     }
 
     fn rescan(&mut self, cx: &mut Context<Self>) {
-        self.busy = true;
-        self.errors.library = None;
         let services = self.station.read(cx).services().clone();
         let library = services.library.clone();
         let task = services
             .runtime
             .spawn(async move { library.rescan_and_wait().await });
+        self.run_busy(cx, |errors| &mut errors.library, async move {
+            task.await
+                .map_err(|_| "Could not rescan the library.".to_owned())
+        });
+    }
+
+    fn clear_log(&mut self, cx: &mut Context<Self>) {
+        let cleared = self
+            .station
+            .update(cx, |station, cx| station.clear_play_log(cx));
+        self.run_busy(cx, |errors| &mut errors.play_log, async move {
+            cleared
+                .await
+                .unwrap_or_else(|_| Err("Play log could not be cleared.".into()))
+                .map_err(|error| format!("Could not clear the play log: {error}"))
+        });
+    }
+
+    fn clear_cache(&mut self, cx: &mut Context<Self>) {
+        let cleared = self.station.read(cx).clear_download_cache();
+        self.run_busy(cx, |errors| &mut errors.settings, async move {
+            cleared
+                .await
+                .map_err(|error| format!("Could not clear the download cache: {error}"))
+        });
+    }
+
+    /// Runs `work` with the buttons disabled, then shows its error (if any).
+    /// `error` picks where the message goes, e.g. `|errors| &mut errors.library`.
+    fn run_busy(
+        &mut self,
+        cx: &mut Context<Self>,
+        error: fn(&mut Errors) -> &mut Option<String>,
+        work: impl Future<Output = Result<(), String>> + 'static,
+    ) {
+        self.busy = true;
+        *error(&mut self.errors) = None;
         cx.spawn(async move |this, cx| {
-            let result = task.await;
+            let result = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.busy = false;
-                if result.is_err() {
-                    this.errors.library = Some("Could not rescan the library.".into());
-                }
+                *error(&mut this.errors) = result.err();
                 cx.notify();
             });
         })
@@ -160,78 +187,64 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn confirm_clear_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Asks before a destructive action, then runs `action`.
+    fn confirm(
+        &mut self,
+        confirmation: &Confirmation,
+        action: fn(&mut Self, &mut Context<Self>),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let view = cx.entity().downgrade();
+        let &Confirmation {
+            title,
+            description,
+            ok_text,
+        } = confirmation;
         window.open_alert_dialog(cx, move |alert: AlertDialog, _, _| {
             let view = view.clone();
             alert
-                .title("Clear the complete play log?")
-                .description("This removes the saved history. The action cannot be undone.")
+                .title(title)
+                .description(description)
                 .confirm()
-                .ok_text("Clear Play Log")
+                .ok_text(ok_text)
                 .ok_variant(ButtonVariant::Danger)
                 .cancel_text("Cancel")
                 .on_ok(move |_, _, cx| {
-                    let _ = view.update(cx, |this, cx| this.clear_log(cx));
+                    let _ = view.update(cx, action);
                     true
                 })
         });
     }
+}
 
-    fn clear_log(&mut self, cx: &mut Context<Self>) {
-        self.busy = true;
-        self.errors.play_log = None;
-        let cleared = self
-            .station
-            .update(cx, |station, cx| station.clear_play_log(cx));
-        cx.spawn(async move |this, cx| {
-            let result = cleared
-                .await
-                .unwrap_or_else(|_| Err("Play log could not be cleared.".into()));
-            let _ = this.update(cx, |this, cx| {
-                this.busy = false;
-                this.errors.play_log = result
-                    .err()
-                    .map(|error| format!("Could not clear the play log: {error}"));
-                cx.notify();
-            });
-        })
-        .detach();
-    }
+/// The wording of a "are you sure?" dialog.
+struct Confirmation {
+    title: &'static str,
+    description: &'static str,
+    ok_text: &'static str,
+}
 
-    fn confirm_clear_cache(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let view = cx.entity().downgrade();
-        window.open_alert_dialog(cx, move |alert: AlertDialog, _, _| {
-            let view = view.clone();
-            alert
-                .title("Clear the download cache?")
-                .description("Tracks currently playing or in the queue will be removed after they are no longer needed. Play counts will be kept.")
-                .confirm()
-                .ok_text("Clear Download Cache")
-                .ok_variant(ButtonVariant::Danger)
-                .cancel_text("Cancel")
-                .on_ok(move |_, _, cx| {
-                    let _ = view.update(cx, |this, cx| this.clear_cache(cx));
-                    true
-                })
-        });
-    }
+const CLEAR_LOG: Confirmation = Confirmation {
+    title: "Clear the complete play log?",
+    description: "This removes the saved history. The action cannot be undone.",
+    ok_text: "Clear Play Log",
+};
 
-    fn clear_cache(&mut self, cx: &mut Context<Self>) {
-        self.busy = true;
-        self.errors.settings = None;
-        let cleared = self.station.read(cx).clear_download_cache();
-        cx.spawn(async move |this, cx| {
-            let result = cleared.await;
-            let _ = this.update(cx, |this, cx| {
-                this.busy = false;
-                this.errors.settings = result
-                    .err()
-                    .map(|error| format!("Could not clear the download cache: {error}"));
-                cx.notify();
-            });
-        })
-        .detach();
+const CLEAR_CACHE: Confirmation = Confirmation {
+    title: "Clear the download cache?",
+    description: "Tracks currently playing or in the queue will be removed after they are no longer needed. Play counts will be kept.",
+    ok_text: "Clear Download Cache",
+};
+
+/// A click handler that runs `action` on the Settings view.
+fn on_view(
+    view: &WeakEntity<SettingsView>,
+    action: impl Fn(&mut SettingsView, &mut Window, &mut Context<SettingsView>) + 'static,
+) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+    let view = view.clone();
+    move |_, window, cx| {
+        let _ = view.update(cx, |this, cx| action(this, window, cx));
     }
 }
 
@@ -284,7 +297,6 @@ impl Render for SettingsView {
                         SettingItem::new(
                             "Library folder",
                             SettingField::render(move |_, _, cx| {
-                                let choose_view = choose_view.clone();
                                 h_flex()
                                     .gap_2()
                                     .child(
@@ -302,11 +314,7 @@ impl Render for SettingsView {
                                             .icon(IconName::FolderOpen)
                                             .label("Choose…")
                                             .disabled(busy)
-                                            .on_click(move |_, window, cx| {
-                                                let _ = choose_view.update(cx, |this, cx| {
-                                                    this.choose_folder(window, cx)
-                                                });
-                                            }),
+                                            .on_click(on_view(&choose_view, Self::choose_folder)),
                                     )
                             }),
                         )
@@ -319,16 +327,13 @@ impl Render for SettingsView {
                     .item(SettingItem::new(
                         "Rescan library",
                         SettingField::render(move |_, _, _| {
-                            let rescan_view = rescan_view.clone();
                             Button::new("rescan")
                                 .outline()
                                 .small()
                                 .label("Rescan")
                                 .loading(busy)
                                 .disabled(!has_folder || busy)
-                                .on_click(move |_, _, cx| {
-                                    let _ = rescan_view.update(cx, |this, cx| this.rescan(cx));
-                                })
+                                .on_click(on_view(&rescan_view, |this, _, cx| this.rescan(cx)))
                         }),
                     ))
                     .items(error_item(self.errors.library.clone())),
@@ -395,17 +400,14 @@ impl Render for SettingsView {
                         SettingItem::new(
                             "Saved history",
                             SettingField::render(move |_, _, _| {
-                                let log_view = log_view.clone();
                                 Button::new("clear-log")
                                     .danger()
                                     .small()
                                     .label("Clear Log")
                                     .disabled(log_count == 0 || busy)
-                                    .on_click(move |_, window, cx| {
-                                        let _ = log_view.update(cx, |this, cx| {
-                                            this.confirm_clear_log(window, cx)
-                                        });
-                                    })
+                                    .on_click(on_view(&log_view, |this, window, cx| {
+                                        this.confirm(&CLEAR_LOG, Self::clear_log, window, cx)
+                                    }))
                             }),
                         )
                         .description(format!(
@@ -422,17 +424,14 @@ impl Render for SettingsView {
                         SettingItem::new(
                             "Downloaded audio",
                             SettingField::render(move |_, _, _| {
-                                let cache_view = cache_view.clone();
                                 Button::new("clear-cache")
                                     .danger()
                                     .small()
                                     .label("Clear Cache")
                                     .disabled(cache.used_bytes == 0 || busy)
-                                    .on_click(move |_, window, cx| {
-                                        let _ = cache_view.update(cx, |this, cx| {
-                                            this.confirm_clear_cache(window, cx)
-                                        });
-                                    })
+                                    .on_click(on_view(&cache_view, |this, window, cx| {
+                                        this.confirm(&CLEAR_CACHE, Self::clear_cache, window, cx)
+                                    }))
                             }),
                         )
                         .description(cache_used),
@@ -516,9 +515,11 @@ impl SettingsView {
             UpdateStatus::Checking => "Checking for updates…".into(),
             UpdateStatus::UpToDate => "Elizabeats is up to date.".into(),
             UpdateStatus::Downloading { version } => format!("Downloading version {version}…").into(),
-            UpdateStatus::Ready { version } => {
-                format!("Version {version} is ready. It installs when you quit Elizabeats.").into()
-            }
+            UpdateStatus::Ready(update) => format!(
+                "Version {} is ready. It installs when you quit Elizabeats.",
+                update.TargetFullRelease.Version
+            )
+            .into(),
             UpdateStatus::Failed(error) => format!("Couldn't check for updates: {error}").into(),
         };
         let ready = matches!(status, UpdateStatus::Ready { .. });

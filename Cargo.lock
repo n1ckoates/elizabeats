@@ -1865,6 +1865,7 @@ name = "elizabeats-audio"
 version = "1.0.0"
 dependencies = [
  "cpal",
+ "elizabeats-core",
  "rtrb",
  "rubato",
  "symphonia",

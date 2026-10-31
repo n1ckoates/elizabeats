@@ -1,4 +1,5 @@
-//! Downloads one audio stream in chunks into a `.part` file.
+//! Fetching a video's audio: youtubei.js + BotGuard (in the system webview)
+//! resolve the stream, which is then downloaded in chunks into a `.part` file.
 //!
 //! YouTube throttles a single long-running request, so (like YouTube's own
 //! web player) we fetch at most ~10 MB per request using the `range=` URL
@@ -9,10 +10,96 @@
 
 use std::time::Duration;
 
+use elizabeats_botguard::{BotguardError, BotguardService};
 use reqwest::{StatusCode, header};
 
 use crate::cache_files::PartFile;
-use crate::error::{YoutubeError, redact};
+use crate::error::{YoutubeError, http_detail, redact};
+use crate::{AudioFetcher, BoxFuture};
+
+/// The real [`AudioFetcher`]. YouTube Music songs only download in full
+/// through the YouTube Music client with a PO token minted by a real browser
+/// engine, which is what youtubei.js + BotGuard (system webview) provide.
+pub(crate) struct StreamFetcher {
+    /// Downloads need it; without it (e.g. in tests) they fail clearly.
+    botguard: Option<BotguardService>,
+    /// Compression is disabled so the bytes we count are exactly the file's.
+    http: reqwest::Client,
+}
+
+impl StreamFetcher {
+    pub(crate) fn new(botguard: Option<BotguardService>) -> Result<Self, YoutubeError> {
+        Ok(Self {
+            botguard,
+            http: http_client(
+                reqwest::Client::builder()
+                    .no_gzip()
+                    .no_brotli()
+                    .connect_timeout(Duration::from_secs(15)),
+            )?,
+        })
+    }
+
+    async fn fetch_audio(&self, video_id: &str, part: &mut PartFile) -> Result<(), YoutubeError> {
+        let botguard = self.botguard.as_ref().ok_or_else(|| YoutubeError::Client {
+            detail: "BotGuard service is not running".to_owned(),
+        })?;
+        let unsupported = YoutubeError::UnsupportedFormat.to_string();
+        let stream =
+            botguard
+                .resolve_audio_stream(video_id)
+                .await
+                .map_err(|error| match error {
+                    BotguardError::Youtube(message) if message == unsupported => {
+                        YoutubeError::UnsupportedFormat
+                    }
+                    BotguardError::Youtube(message) => YoutubeError::Unavailable {
+                        message,
+                        detail: "youtubei.js playability".to_owned(),
+                    },
+                    other => YoutubeError::Player {
+                        detail: redact(&other.to_string()),
+                    },
+                })?;
+        if !stream
+            .mime_type
+            .to_ascii_lowercase()
+            .starts_with("audio/mp4")
+        {
+            return Err(YoutubeError::UnsupportedFormat);
+        }
+        tracing::info!(
+            "downloading {video_id}: itag {} ({:?} bytes)",
+            stream.itag,
+            stream.content_length
+        );
+        let request = StreamRequest {
+            url: &stream.url,
+            user_agent: stream.user_agent.as_deref().unwrap_or_default(),
+            content_length: stream.content_length,
+        };
+        download_stream(&self.http, &request, part, &DownloadLimits::default()).await
+    }
+}
+
+impl AudioFetcher for StreamFetcher {
+    fn fetch<'a>(
+        &'a self,
+        video_id: &'a str,
+        part: &'a mut PartFile,
+    ) -> BoxFuture<'a, Result<(), YoutubeError>> {
+        Box::pin(self.fetch_audio(video_id, part))
+    }
+}
+
+/// Builds an HTTP client, with a user-facing error if that fails.
+pub(crate) fn http_client(
+    builder: reqwest::ClientBuilder,
+) -> Result<reqwest::Client, YoutubeError> {
+    builder.build().map_err(|error| YoutubeError::Client {
+        detail: http_detail(error),
+    })
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct DownloadLimits {
@@ -41,19 +128,6 @@ pub(crate) struct StreamRequest<'a> {
     pub user_agent: &'a str,
     /// Exact stream size in bytes, when YouTube told us.
     pub content_length: Option<u64>,
-}
-
-/// An HTTP client for stream downloads. Compression is disabled so the bytes
-/// we count are exactly the bytes of the file.
-pub(crate) fn build_http_client() -> Result<reqwest::Client, YoutubeError> {
-    reqwest::Client::builder()
-        .no_gzip()
-        .no_brotli()
-        .connect_timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| YoutubeError::Client {
-            detail: redact(&error.without_url().to_string()),
-        })
 }
 
 /// Downloads the whole stream into `part`. On error the caller drops `part`,
@@ -250,13 +324,13 @@ fn parse_content_range_total(value: &str) -> Option<u64> {
 }
 
 fn network_failure(error: reqwest::Error) -> Failure {
-    let is_timeout = error.is_timeout();
-    let detail = redact(&error.without_url().to_string());
-    if is_timeout {
-        Failure::Retry(YoutubeError::DownloadTimedOut)
+    Failure::Retry(if error.is_timeout() {
+        YoutubeError::DownloadTimedOut
     } else {
-        Failure::Retry(YoutubeError::DownloadNetwork { detail })
-    }
+        YoutubeError::DownloadNetwork {
+            detail: http_detail(error),
+        }
+    })
 }
 
 fn incomplete(detail: String) -> YoutubeError {
@@ -270,7 +344,7 @@ fn chunk_size(max: u64) -> u64 {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -284,19 +358,19 @@ pub(crate) mod tests {
     /// `/ok`, `/header` (Range headers, no length given up front), `/forbidden`,
     /// `/flaky` (first request 500), `/broken` (always 503), `/short`
     /// (drops the last bytes), `/hang` (never answers).
-    pub(crate) struct TestServer {
-        pub base: String,
-        pub requests: Arc<Mutex<Vec<String>>>,
+    struct TestServer {
+        base: String,
+        requests: Arc<Mutex<Vec<String>>>,
     }
 
-    pub(crate) fn test_body(len: usize) -> Vec<u8> {
+    fn test_body(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 251) as u8).collect()
     }
 
     impl TestServer {
-        pub(crate) async fn start(body: Vec<u8>) -> std::io::Result<Self> {
-            let listener = TcpListener::bind("127.0.0.1:0").await?;
-            let base = format!("http://{}", listener.local_addr()?);
+        async fn start(body: Vec<u8>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
             let requests = Arc::new(Mutex::new(Vec::new()));
             let log = requests.clone();
             let body = Arc::new(body);
@@ -322,9 +396,7 @@ pub(crate) mod tests {
                             .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_owned()))
                             .collect();
                         let count = {
-                            let mut log = log
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let mut log = log.lock().unwrap();
                             log.push(target.clone());
                             log.len()
                         };
@@ -337,14 +409,24 @@ pub(crate) mod tests {
                     });
                 }
             });
-            Ok(Self { base, requests })
+            Self { base, requests }
         }
 
-        pub(crate) fn request_log(&self) -> Vec<String> {
-            self.requests
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
+        fn request_log(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        async fn download(
+            &self,
+            path: &str,
+            content_length: Option<u64>,
+        ) -> (Result<u64, YoutubeError>, tempfile::TempDir) {
+            download(
+                &format!("{}{path}", self.base),
+                content_length,
+                &fast_limits(),
+            )
+            .await
         }
     }
 
@@ -413,33 +495,21 @@ pub(crate) mod tests {
         }
     }
 
-    async fn run(
-        server: &TestServer,
-        path: &str,
-        content_length: Option<u64>,
-    ) -> (Result<u64, YoutubeError>, tempfile::TempDir) {
-        run_with(server, path, content_length, &fast_limits()).await
-    }
-
-    async fn run_with(
-        server: &TestServer,
-        path: &str,
+    /// Downloads `url` into a fresh cache folder, as the cache does.
+    async fn download(
+        url: &str,
         content_length: Option<u64>,
         limits: &DownloadLimits,
     ) -> (Result<u64, YoutubeError>, tempfile::TempDir) {
-        let temp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let temp = tempfile::tempdir().unwrap();
         let files = CacheFiles::new(temp.path().to_owned());
-        let http = build_http_client().unwrap_or_else(|e| panic!("{e}"));
-        let url = format!("{}{path}", server.base);
+        let http = http_client(reqwest::Client::builder()).unwrap();
         let request = StreamRequest {
-            url: &url,
+            url,
             user_agent: "test",
             content_length,
         };
-        let mut part = files
-            .begin("abcdefghijk.m4a")
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
+        let mut part = files.begin("abcdefghijk.m4a").await.unwrap();
         let result = match download_stream(&http, &request, &mut part, limits).await {
             Ok(()) => part.finish().await.map_err(YoutubeError::cache),
             Err(error) => Err(error),
@@ -449,23 +519,18 @@ pub(crate) mod tests {
 
     fn dir_names(temp: &tempfile::TempDir) -> Vec<String> {
         std::fs::read_dir(temp.path())
-            .map(|dir| {
-                dir.filter_map(Result::ok)
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .collect()
-            })
-            .unwrap_or_default()
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
     }
 
     #[tokio::test]
     async fn downloads_in_chunks_with_range_param() {
         let body = test_body(4500);
-        let server = TestServer::start(body.clone())
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        let (result, temp) = run(&server, "/ok?sig=1", Some(4500)).await;
+        let server = TestServer::start(body.clone()).await;
+        let (result, temp) = server.download("/ok?sig=1", Some(4500)).await;
         assert_eq!(result, Ok(4500));
-        let saved = std::fs::read(temp.path().join("abcdefghijk.m4a")).unwrap_or_default();
+        let saved = std::fs::read(temp.path().join("abcdefghijk.m4a")).unwrap();
         assert_eq!(saved, body);
         let log = server.request_log();
         assert!(log.len() >= 5, "chunked: {log:?}");
@@ -476,21 +541,17 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn downloads_with_range_headers_when_length_unknown() {
         let body = test_body(2500);
-        let server = TestServer::start(body.clone())
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        let (result, temp) = run(&server, "/header", None).await;
+        let server = TestServer::start(body.clone()).await;
+        let (result, temp) = server.download("/header", None).await;
         assert_eq!(result, Ok(2500));
-        let saved = std::fs::read(temp.path().join("abcdefghijk.m4a")).unwrap_or_default();
+        let saved = std::fs::read(temp.path().join("abcdefghijk.m4a")).unwrap();
         assert_eq!(saved, body);
     }
 
     #[tokio::test]
     async fn length_mismatch_fails_and_cleans_up() {
-        let server = TestServer::start(test_body(3000))
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        let (result, temp) = run(&server, "/short", Some(3000)).await;
+        let server = TestServer::start(test_body(3000)).await;
+        let (result, temp) = server.download("/short", Some(3000)).await;
         assert!(
             matches!(result, Err(YoutubeError::DownloadIncomplete { .. })),
             "{result:?}"
@@ -500,10 +561,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn forbidden_is_not_retried() {
-        let server = TestServer::start(test_body(100))
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        let (result, temp) = run(&server, "/forbidden", Some(100)).await;
+        let server = TestServer::start(test_body(100)).await;
+        let (result, temp) = server.download("/forbidden", Some(100)).await;
         assert_eq!(result, Err(YoutubeError::DownloadForbidden));
         assert_eq!(server.request_log().len(), 1);
         assert!(dir_names(&temp).is_empty());
@@ -512,16 +571,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn server_errors_are_retried() {
         let body = test_body(1500);
-        let server = TestServer::start(body.clone())
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        let (result, _temp) = run(&server, "/flaky", Some(1500)).await;
+        let server = TestServer::start(body.clone()).await;
+        let (result, _temp) = server.download("/flaky", Some(1500)).await;
         assert_eq!(result, Ok(1500));
 
-        let server = TestServer::start(body)
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        let (result, temp) = run(&server, "/broken", Some(1500)).await;
+        let server = TestServer::start(body).await;
+        let (result, temp) = server.download("/broken", Some(1500)).await;
         assert_eq!(result, Err(YoutubeError::DownloadHttp { status: 503 }));
         assert_eq!(server.request_log().len(), 3, "1 try + 2 retries");
         assert!(dir_names(&temp).is_empty());
@@ -529,10 +584,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn chunk_timeout_fails_and_cleans_up() {
-        let server = TestServer::start(test_body(100))
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        let (result, temp) = run(&server, "/hang", Some(100)).await;
+        let server = TestServer::start(test_body(100)).await;
+        let (result, temp) = server.download("/hang", Some(100)).await;
         assert_eq!(result, Err(YoutubeError::DownloadTimedOut));
         assert_eq!(server.request_log().len(), 3);
         assert!(dir_names(&temp).is_empty());
@@ -541,20 +594,17 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn network_errors_are_reported_without_urls() {
         // Nothing listens on this port.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("{e}"));
-        let port = listener.local_addr().map(|a| a.port()).unwrap_or(1);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
         drop(listener);
-        let server = TestServer {
-            base: format!("http://127.0.0.1:{port}"),
-            requests: Arc::default(),
-        };
         // Windows keeps retrying a refused connection for about 2 s before
         // failing, so allow longer than that (or it reports a timeout).
         let limits = DownloadLimits {
             chunk_timeout: Duration::from_secs(5),
             ..fast_limits()
         };
-        let (result, _temp) = run_with(&server, "/ok?pot=SECRET", Some(100), &limits).await;
+        let url = format!("http://{address}/ok?pot=SECRET");
+        let (result, _temp) = download(&url, Some(100), &limits).await;
         match result {
             Err(error @ YoutubeError::DownloadNetwork { .. }) => {
                 assert!(!error.diagnostic_message().contains("SECRET"));

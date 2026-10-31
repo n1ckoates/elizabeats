@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Local, NaiveDate};
-use elizabeats_core::{PlayLogEntry, PlayLogReason, StoredQueueItem};
+use elizabeats_core::{ItemKind, PlayLogEntry, PlayLogReason};
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::date_picker::DatePicker;
@@ -68,11 +68,9 @@ pub fn clipboard_text(entries: &[PlayLogEntry]) -> String {
             let time = parse_time(&entry.started_at)
                 .map(|time| time.format("%H:%M").to_string())
                 .unwrap_or_default();
-            match &entry.item {
-                StoredQueueItem::Break { .. } => format!("[Break - {time}]"),
-                StoredQueueItem::Track { track, .. } => {
-                    format!("{} - {} - {time}", track.artist, track.title)
-                }
+            match &entry.item.kind {
+                ItemKind::Break => format!("[Break - {time}]"),
+                ItemKind::Track(track) => format!("{} - {} - {time}", track.artist, track.title),
             }
         })
         .collect::<Vec<_>>()
@@ -203,8 +201,8 @@ impl AppView {
         let time = parse_time(&entry.started_at)
             .map(|time| time.format("%I:%M %p").to_string())
             .unwrap_or_default();
-        let (media, details): (AnyElement, AnyElement) = match &entry.item {
-            StoredQueueItem::Track { track, .. } => {
+        let (media, details): (AnyElement, AnyElement) = match &entry.item.kind {
+            ItemKind::Track(track) => {
                 let image = self
                     .artwork
                     .update(cx, |artwork, cx| artwork.get(track, cx));
@@ -213,7 +211,7 @@ impl AppView {
                     track_details(track, Vec::new(), cx).into_any_element(),
                 )
             }
-            StoredQueueItem::Break { .. } => (
+            ItemKind::Break => (
                 break_tile(RowSize::Regular.media(), cx).into_any_element(),
                 v_flex()
                     .flex_1()
@@ -249,9 +247,9 @@ impl AppView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use elizabeats_core::{SourceId, Track};
+    use elizabeats_core::{QueueItem, SourceId, Track};
 
-    fn entry(id: &str, started_at: &str, item: StoredQueueItem) -> PlayLogEntry {
+    fn entry(id: &str, started_at: &str, item: QueueItem) -> PlayLogEntry {
         PlayLogEntry {
             id: id.into(),
             item,
@@ -261,10 +259,10 @@ mod tests {
         }
     }
 
-    fn track_item() -> StoredQueueItem {
-        StoredQueueItem::Track {
-            id: "q".into(),
-            track: Track {
+    fn track_item() -> QueueItem {
+        QueueItem::track(
+            "q",
+            Track {
                 id: "t".into(),
                 source: SourceId::Local,
                 title: "Song".into(),
@@ -274,7 +272,7 @@ mod tests {
                 artwork_url: None,
                 explicit: false,
             },
-        }
+        )
     }
 
     #[test]
@@ -286,11 +284,7 @@ mod tests {
                 .unwrap_or_default()
         };
         let entries = vec![
-            entry(
-                "2",
-                &local(14, 7),
-                StoredQueueItem::Break { id: "b".into() },
-            ),
+            entry("2", &local(14, 7), QueueItem::new_break("b")),
             entry("1", &local(14, 3), track_item()),
         ];
         assert_eq!(

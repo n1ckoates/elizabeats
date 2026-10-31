@@ -1,80 +1,84 @@
 //! The Queue: DJ-authored Tracks and Breaks, plus the pure editing rules.
 //!
-//! Commands can change Upcoming Items only. The Active Item and an Incoming
-//! Track keep their roles (and positions) until playback moves them.
+//! Edits change Upcoming Items only. The Active Item and an Incoming Track
+//! keep their roles (and positions) until playback moves them.
 
-use crate::domain::{PlaybackProgress, StoredQueueItem, Track};
+use crate::domain::{ItemKind, PlaybackProgress, QueueItem, Track};
 
-/// Whether an Upcoming Track's audio is ready to play.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Readiness {
-    Preparing,
-    Ready,
-    Unavailable,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum ItemKind {
-    Track(Track),
-    Break,
-}
-
-/// A Queue item that has not begun Playing.
-#[derive(Clone, Debug, PartialEq)]
-pub struct UpcomingItem {
-    pub id: String,
-    pub kind: ItemKind,
-    /// Always `Ready` for Breaks.
-    pub readiness: Readiness,
-}
-
-impl UpcomingItem {
-    pub fn track(id: String, track: Track) -> Self {
-        Self {
-            id,
-            kind: ItemKind::Track(track),
-            readiness: Readiness::Preparing,
-        }
-    }
-
-    pub fn new_break(id: String) -> Self {
-        Self {
-            id,
-            kind: ItemKind::Break,
-            readiness: Readiness::Ready,
-        }
-    }
-}
+/// Identifies one file loaded into the audio engine.
+pub type LoadId = u64;
 
 /// A Playing item (the Active Item or the Incoming Track).
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlayingItem {
-    pub id: String,
-    pub kind: ItemKind,
+    pub item: QueueItem,
     pub progress: PlaybackProgress,
+    /// The engine load playing it; `None` for a Break.
+    pub load: Option<LoadId>,
 }
 
+impl PlayingItem {
+    pub fn new(item: QueueItem, load: Option<LoadId>) -> Self {
+        let duration = item
+            .as_track()
+            .and_then(|track| track.duration_seconds)
+            .unwrap_or(0.0);
+        Self {
+            item,
+            progress: PlaybackProgress {
+                current_time: 0.0,
+                duration,
+            },
+            load,
+        }
+    }
+}
+
+/// What is Playing, and any start the Session is waiting on.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Queue {
+pub enum Playback {
     Stopped {
-        queued: Vec<UpcomingItem>,
+        /// An Upcoming item that starts once its Track is prepared.
+        starting: Option<String>,
     },
     Playing {
         active: PlayingItem,
-        queued: Vec<UpcomingItem>,
+        /// An Upcoming Track to crossfade into once it is prepared (a manual
+        /// skip or "Play now").
+        crossfade_to: Option<String>,
+        /// The automatic crossfade near the end has already been attempted.
+        auto_crossfade_tried: bool,
     },
     /// Both outgoing and incoming are Tracks.
     Crossfading {
         active: PlayingItem,
         incoming: PlayingItem,
-        queued: Vec<UpcomingItem>,
+        /// Started by the DJ: the outgoing Track leaves as soon as the fade completes.
+        manual: bool,
     },
 }
 
-impl Default for Queue {
+impl Default for Playback {
     fn default() -> Self {
-        Self::Stopped { queued: Vec::new() }
+        Self::Stopped { starting: None }
     }
+}
+
+impl Playback {
+    pub fn playing(active: PlayingItem) -> Self {
+        Self::Playing {
+            active,
+            crossfade_to: None,
+            auto_crossfade_tried: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Queue {
+    pub playback: Playback,
+    /// Items that have not begun Playing, in order.
+    pub upcoming: Vec<QueueItem>,
 }
 
 /// A borrowed view of any Queue item, in display order.
@@ -82,87 +86,72 @@ impl Default for Queue {
 pub enum QueueItemRef<'a> {
     Active(&'a PlayingItem),
     Incoming(&'a PlayingItem),
-    Upcoming(&'a UpcomingItem),
+    Upcoming(&'a QueueItem),
 }
 
 impl<'a> QueueItemRef<'a> {
-    pub fn id(self) -> &'a str {
+    pub fn item(self) -> &'a QueueItem {
         match self {
-            Self::Active(item) | Self::Incoming(item) => &item.id,
-            Self::Upcoming(item) => &item.id,
+            Self::Active(playing) | Self::Incoming(playing) => &playing.item,
+            Self::Upcoming(item) => item,
         }
+    }
+
+    pub fn id(self) -> &'a str {
+        &self.item().id
     }
 
     pub fn kind(self) -> &'a ItemKind {
-        match self {
-            Self::Active(item) | Self::Incoming(item) => &item.kind,
-            Self::Upcoming(item) => &item.kind,
-        }
+        &self.item().kind
     }
 
     pub fn track(self) -> Option<&'a Track> {
-        match self.kind() {
-            ItemKind::Track(track) => Some(track),
-            ItemKind::Break => None,
+        self.item().as_track()
+    }
+
+    pub fn progress(self) -> Option<PlaybackProgress> {
+        match self {
+            Self::Active(playing) | Self::Incoming(playing) => Some(playing.progress),
+            Self::Upcoming(_) => None,
         }
-    }
-
-    pub fn is_upcoming(self) -> bool {
-        matches!(self, Self::Upcoming(_))
-    }
-
-    pub fn stored(self) -> StoredQueueItem {
-        stored_item(self.id(), self.kind())
     }
 }
 
-pub fn stored_item(id: &str, kind: &ItemKind) -> StoredQueueItem {
-    match kind {
-        ItemKind::Track(track) => StoredQueueItem::Track {
-            id: id.to_owned(),
-            track: track.clone(),
-        },
-        ItemKind::Break => StoredQueueItem::Break { id: id.to_owned() },
-    }
+/// Which way [`Queue::step`] moves items.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Up,
+    Down,
 }
 
 impl Queue {
-    pub fn queued(&self) -> &[UpcomingItem] {
-        match self {
-            Self::Stopped { queued }
-            | Self::Playing { queued, .. }
-            | Self::Crossfading { queued, .. } => queued,
-        }
-    }
-
-    pub fn queued_mut(&mut self) -> &mut Vec<UpcomingItem> {
-        match self {
-            Self::Stopped { queued }
-            | Self::Playing { queued, .. }
-            | Self::Crossfading { queued, .. } => queued,
+    pub fn stopped(upcoming: Vec<QueueItem>) -> Self {
+        Self {
+            playback: Playback::default(),
+            upcoming,
         }
     }
 
     pub fn active(&self) -> Option<&PlayingItem> {
-        match self {
-            Self::Stopped { .. } => None,
-            Self::Playing { active, .. } | Self::Crossfading { active, .. } => Some(active),
+        match &self.playback {
+            Playback::Stopped { .. } => None,
+            Playback::Playing { active, .. } | Playback::Crossfading { active, .. } => Some(active),
         }
     }
 
     pub fn incoming(&self) -> Option<&PlayingItem> {
-        match self {
-            Self::Crossfading { incoming, .. } => Some(incoming),
+        match &self.playback {
+            Playback::Crossfading { incoming, .. } => Some(incoming),
             _ => None,
         }
     }
 
     pub fn is_stopped(&self) -> bool {
-        matches!(self, Self::Stopped { .. })
+        matches!(self.playback, Playback::Stopped { .. })
     }
 
     pub fn is_crossfading(&self) -> bool {
-        matches!(self, Self::Crossfading { .. })
+        matches!(self.playback, Playback::Crossfading { .. })
     }
 
     /// All items in display order: Active, Incoming, then Upcoming.
@@ -171,11 +160,11 @@ impl Queue {
             .map(QueueItemRef::Active)
             .into_iter()
             .chain(self.incoming().map(QueueItemRef::Incoming))
-            .chain(self.queued().iter().map(QueueItemRef::Upcoming))
+            .chain(self.upcoming.iter().map(QueueItemRef::Upcoming))
     }
 
     pub fn len(&self) -> usize {
-        self.first_mutable_index() + self.queued().len()
+        self.first_mutable_index() + self.upcoming.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -190,145 +179,93 @@ impl Queue {
         self.items().position(|item| item.id() == id)
     }
 
-    /// The first display index that commands may change.
+    /// The first display index that edits may change.
     pub fn first_mutable_index(&self) -> usize {
-        match self {
-            Self::Stopped { .. } => 0,
-            Self::Playing { .. } => 1,
-            Self::Crossfading { .. } => 2,
+        match self.playback {
+            Playback::Stopped { .. } => 0,
+            Playback::Playing { .. } => 1,
+            Playback::Crossfading { .. } => 2,
         }
-    }
-
-    pub fn stored_items(&self) -> Vec<StoredQueueItem> {
-        self.items().map(QueueItemRef::stored).collect()
     }
 
     pub fn tracks(&self) -> impl Iterator<Item = &Track> {
         self.items().filter_map(QueueItemRef::track)
     }
-}
 
-/// An edit the DJ makes to the Queue. Indices are display indices.
-#[derive(Clone, Debug, PartialEq)]
-pub enum QueueCommand {
-    InsertTrack {
-        at: usize,
-        item_id: String,
-        track: Track,
-    },
-    InsertBreak {
-        at: usize,
-        item_id: String,
-    },
-    InsertBreakAfter {
-        after_id: String,
-        item_id: String,
-    },
-    /// Removes these Upcoming items.
-    Remove {
-        item_ids: Vec<String>,
-    },
-    /// Moves these Upcoming items, together and in Queue order, to display
-    /// slot `slot` (the gap just before the item currently at that index).
-    Move {
-        item_ids: Vec<String>,
-        slot: usize,
-    },
-    /// Moves each of these Upcoming items one place, keeping the gaps between
-    /// them. Does nothing if any of them is already at the end it moves toward.
-    Step {
-        item_ids: Vec<String>,
-        direction: Direction,
-    },
-}
+    /// Every item, in display order, as it is saved.
+    pub fn stored_items(&self) -> Vec<QueueItem> {
+        self.items().map(|item| item.item().clone()).collect()
+    }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Direction {
-    Up,
-    Down,
-}
+    // ---- Edits (display indices; Upcoming items only) ------------------------
 
-/// Applies `command`, returning the edited Queue (unchanged when the command
-/// does not apply). Never touches the Active Item or Incoming Track.
-pub fn edit_queue(queue: &Queue, command: QueueCommand) -> Queue {
-    let offset = queue.first_mutable_index();
-    let mut next = queue.clone();
-    let queued = next.queued_mut();
-    match command {
-        QueueCommand::Remove { item_ids } => {
-            queued.retain(|item| !item_ids.contains(&item.id));
+    /// Inserts at display index `at` (clamped). Ignores a duplicate id, and a
+    /// Break while crossfading: it may not separate the outgoing and incoming Tracks.
+    pub fn insert(&mut self, at: usize, item: QueueItem) {
+        let is_break = item.kind == ItemKind::Break;
+        if self.item(&item.id).is_some() || (is_break && self.is_crossfading()) {
+            return;
         }
-        QueueCommand::Move { item_ids, slot } => {
-            let slot = slot.saturating_sub(offset).min(queued.len());
-            // Taking the moved items out shifts the slot up by those above it.
-            let above = queued[..slot]
-                .iter()
-                .filter(|item| item_ids.contains(&item.id))
-                .count();
-            let (moved, mut rest): (Vec<_>, Vec<_>) = queued
-                .drain(..)
-                .partition(|item| item_ids.contains(&item.id));
-            let at = slot - above;
-            rest.splice(at..at, moved);
-            *queued = rest;
-        }
-        QueueCommand::Step {
-            item_ids,
-            direction,
-        } => {
-            let selected: Vec<bool> = queued
-                .iter()
-                .map(|item| item_ids.contains(&item.id))
-                .collect();
-            let blocked = match direction {
-                Direction::Up => selected.first() == Some(&true),
-                Direction::Down => selected.last() == Some(&true),
-            };
-            if blocked {
-                return queue.clone();
+        let at = self.upcoming_index(at);
+        self.upcoming.insert(at, item);
+    }
+
+    pub fn remove(&mut self, ids: &[String]) {
+        self.upcoming.retain(|item| !ids.contains(&item.id));
+    }
+
+    /// Moves these items, together and in Queue order, to display slot `slot`
+    /// (the gap just before the item currently at that index).
+    pub fn move_to(&mut self, ids: &[String], slot: usize) {
+        let slot = self.upcoming_index(slot);
+        // Taking the moved items out shifts the slot up by those above it.
+        let above = self.upcoming[..slot]
+            .iter()
+            .filter(|item| ids.contains(&item.id))
+            .count();
+        let (moved, mut rest): (Vec<_>, Vec<_>) = self
+            .upcoming
+            .drain(..)
+            .partition(|item| ids.contains(&item.id));
+        let at = slot - above;
+        rest.splice(at..at, moved);
+        self.upcoming = rest;
+    }
+
+    /// Moves each of these items one place, keeping the gaps between them.
+    /// Does nothing if any of them is already at the end it moves toward.
+    pub fn step(&mut self, ids: &[String], direction: Direction) {
+        let len = self.upcoming.len();
+        let positions: Vec<usize> = (0..len)
+            .filter(|&i| ids.contains(&self.upcoming[i].id))
+            .collect();
+        // Each selected item swaps with its neighbour, starting from the end
+        // it moves toward, so adjacent selected items move along as a block.
+        match direction {
+            Direction::Up => {
+                if positions.first() == Some(&0) {
+                    return;
+                }
+                for i in positions {
+                    self.upcoming.swap(i - 1, i);
+                }
             }
-            // Each selected item swaps with its neighbour; walking from the
-            // leading end moves adjacent selected items along as a block.
-            match direction {
-                Direction::Up => (1..selected.len())
-                    .filter(|&i| selected[i])
-                    .for_each(|i| queued.swap(i - 1, i)),
-                Direction::Down => (0..selected.len().saturating_sub(1))
-                    .rev()
-                    .filter(|&i| selected[i])
-                    .for_each(|i| queued.swap(i, i + 1)),
+            Direction::Down => {
+                if positions.last().is_some_and(|&i| i + 1 == len) {
+                    return;
+                }
+                for i in positions.into_iter().rev() {
+                    self.upcoming.swap(i, i + 1);
+                }
             }
-        }
-        QueueCommand::InsertTrack { at, item_id, track } => {
-            if queue.item(&item_id).is_some() {
-                return queue.clone();
-            }
-            let at = at.saturating_sub(offset).min(queued.len());
-            queued.insert(at, UpcomingItem::track(item_id, track));
-        }
-        QueueCommand::InsertBreak { at, item_id } => {
-            // A Break may not separate the outgoing and incoming Tracks.
-            if queue.is_crossfading() || queue.item(&item_id).is_some() {
-                return queue.clone();
-            }
-            let at = at.saturating_sub(offset).min(queued.len());
-            queued.insert(at, UpcomingItem::new_break(item_id));
-        }
-        QueueCommand::InsertBreakAfter { after_id, item_id } => {
-            if queue.is_crossfading() || queue.item(&item_id).is_some() {
-                return queue.clone();
-            }
-            let at = if let Some(index) = queued.iter().position(|item| item.id == after_id) {
-                index + 1
-            } else if queue.active().is_some_and(|active| active.id == after_id) {
-                0
-            } else {
-                return queue.clone();
-            };
-            queued.insert(at, UpcomingItem::new_break(item_id));
         }
     }
-    next
+
+    fn upcoming_index(&self, display_index: usize) -> usize {
+        display_index
+            .saturating_sub(self.first_mutable_index())
+            .min(self.upcoming.len())
+    }
 }
 
 #[cfg(test)]
@@ -349,15 +286,28 @@ mod tests {
         }
     }
 
-    fn upcoming(id: &str) -> UpcomingItem {
-        UpcomingItem::track(id.into(), track(id))
+    fn upcoming(id: &str) -> QueueItem {
+        QueueItem::track(id, track(id))
     }
 
     fn playing(id: &str) -> PlayingItem {
-        PlayingItem {
-            id: id.into(),
-            kind: ItemKind::Track(track(id)),
-            progress: PlaybackProgress::default(),
+        PlayingItem::new(upcoming(id), Some(1))
+    }
+
+    fn queue(active: &[&str], upcoming_ids: &[&str]) -> Queue {
+        let mut playing = active.iter().map(|id| playing(id));
+        let playback = match (playing.next(), playing.next()) {
+            (None, _) => Playback::default(),
+            (Some(active), None) => Playback::playing(active),
+            (Some(active), Some(incoming)) => Playback::Crossfading {
+                active,
+                incoming,
+                manual: false,
+            },
+        };
+        Queue {
+            playback,
+            upcoming: upcoming_ids.iter().map(|id| upcoming(id)).collect(),
         }
     }
 
@@ -365,13 +315,19 @@ mod tests {
         queue.items().map(QueueItemRef::id).collect()
     }
 
+    fn strings(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    fn edited(queue: &Queue, edit: impl FnOnce(&mut Queue)) -> Queue {
+        let mut queue = queue.clone();
+        edit(&mut queue);
+        queue
+    }
+
     #[test]
     fn items_are_in_display_order() {
-        let queue = Queue::Crossfading {
-            active: playing("a"),
-            incoming: playing("b"),
-            queued: vec![upcoming("c")],
-        };
+        let queue = queue(&["a", "b"], &["c"]);
         assert_eq!(ids(&queue), ["a", "b", "c"]);
         assert_eq!(queue.first_mutable_index(), 2);
         assert_eq!(queue.len(), 3);
@@ -379,228 +335,84 @@ mod tests {
     }
 
     #[test]
-    fn insert_track_respects_locked_positions() {
-        let queue = Queue::Playing {
-            active: playing("a"),
-            queued: vec![upcoming("b")],
-        };
-        let edited = edit_queue(
-            &queue,
-            QueueCommand::InsertTrack {
-                at: 0,
-                item_id: "x".into(),
-                track: track("x"),
-            },
+    fn insert_respects_locked_positions_and_ids() {
+        let q = queue(&["a"], &["b"]);
+        assert_eq!(
+            ids(&edited(&q, |q| q.insert(0, upcoming("x")))),
+            ["a", "x", "b"]
         );
-        assert_eq!(ids(&edited), ["a", "x", "b"]);
-        let edited = edit_queue(
-            &queue,
-            QueueCommand::InsertTrack {
-                at: 99,
-                item_id: "y".into(),
-                track: track("y"),
-            },
+        assert_eq!(
+            ids(&edited(&q, |q| q.insert(99, upcoming("y")))),
+            ["a", "b", "y"]
         );
-        assert_eq!(ids(&edited), ["a", "b", "y"]);
-    }
-
-    #[test]
-    fn duplicate_item_ids_are_rejected() {
-        let queue = Queue::Stopped {
-            queued: vec![upcoming("a")],
-        };
-        let edited = edit_queue(
-            &queue,
-            QueueCommand::InsertTrack {
-                at: 0,
-                item_id: "a".into(),
-                track: track("z"),
-            },
+        // Duplicate ids are rejected.
+        assert_eq!(
+            edited(&q, |q| q.insert(0, QueueItem::track("b", track("z")))),
+            q
         );
-        assert_eq!(edited, queue);
     }
 
     #[test]
     fn breaks_cannot_be_inserted_while_crossfading() {
-        let queue = Queue::Crossfading {
-            active: playing("a"),
-            incoming: playing("b"),
-            queued: vec![],
-        };
-        let edited = edit_queue(
-            &queue,
-            QueueCommand::InsertBreak {
-                at: 2,
-                item_id: "br".into(),
-            },
-        );
-        assert_eq!(edited, queue);
-        let edited = edit_queue(
-            &queue,
-            QueueCommand::InsertBreakAfter {
-                after_id: "a".into(),
-                item_id: "br".into(),
-            },
-        );
-        assert_eq!(edited, queue);
+        let q = queue(&["a", "b"], &[]);
+        assert_eq!(edited(&q, |q| q.insert(2, QueueItem::new_break("br"))), q);
         // Tracks may still be added while crossfading.
-        let edited = edit_queue(
-            &queue,
-            QueueCommand::InsertTrack {
-                at: 0,
-                item_id: "c".into(),
-                track: track("c"),
-            },
+        assert_eq!(
+            ids(&edited(&q, |q| q.insert(0, upcoming("c")))),
+            ["a", "b", "c"]
         );
-        assert_eq!(ids(&edited), ["a", "b", "c"]);
-    }
-
-    #[test]
-    fn insert_break_after_active_goes_first() {
-        let queue = Queue::Playing {
-            active: playing("a"),
-            queued: vec![upcoming("b")],
-        };
-        let edited = edit_queue(
-            &queue,
-            QueueCommand::InsertBreakAfter {
-                after_id: "a".into(),
-                item_id: "br".into(),
-            },
-        );
-        assert_eq!(ids(&edited), ["a", "br", "b"]);
-        let edited = edit_queue(
-            &queue,
-            QueueCommand::InsertBreakAfter {
-                after_id: "b".into(),
-                item_id: "br".into(),
-            },
-        );
-        assert_eq!(ids(&edited), ["a", "b", "br"]);
-        let unknown = edit_queue(
-            &queue,
-            QueueCommand::InsertBreakAfter {
-                after_id: "nope".into(),
-                item_id: "br".into(),
-            },
-        );
-        assert_eq!(unknown, queue);
     }
 
     #[test]
     fn move_clamps_and_ignores_locked_items() {
-        let queue = Queue::Playing {
-            active: playing("a"),
-            queued: vec![upcoming("b"), upcoming("c"), upcoming("d")],
-        };
-        let mv = |item_ids: &[&str], slot| QueueCommand::Move {
-            item_ids: item_ids.iter().map(|id| (*id).to_owned()).collect(),
-            slot,
-        };
-        assert_eq!(
-            ids(&edit_queue(&queue, mv(&["d"], 0))),
-            ["a", "d", "b", "c"]
-        );
-        assert_eq!(
-            ids(&edit_queue(&queue, mv(&["b"], 10))),
-            ["a", "c", "d", "b"]
-        );
-        assert_eq!(edit_queue(&queue, mv(&["a"], 3)), queue);
+        let q = queue(&["a"], &["b", "c", "d"]);
+        let mv = |ids: &[&str], slot| edited(&q, |q| q.move_to(&strings(ids), slot));
+        assert_eq!(ids(&mv(&["d"], 0)), ["a", "d", "b", "c"]);
+        assert_eq!(ids(&mv(&["b"], 10)), ["a", "c", "d", "b"]);
+        assert_eq!(mv(&["a"], 3), q);
         // Onto its own position: unchanged.
-        assert_eq!(edit_queue(&queue, mv(&["c"], 3)), queue);
+        assert_eq!(mv(&["c"], 3), q);
     }
 
     #[test]
     fn moving_several_items_groups_them_in_queue_order() {
-        let queue = Queue::Playing {
-            active: playing("a"),
-            queued: vec![
-                upcoming("b"),
-                upcoming("c"),
-                upcoming("d"),
-                upcoming("e"),
-                upcoming("f"),
-            ],
-        };
-        let mv = |item_ids: &[&str], slot| QueueCommand::Move {
-            item_ids: item_ids.iter().map(|id| (*id).to_owned()).collect(),
-            slot,
-        };
+        let q = queue(&["a"], &["b", "c", "d", "e", "f"]);
+        let mv = |ids: &[&str], slot| edited(&q, |q| q.move_to(&strings(ids), slot));
         // Selection order doesn't matter; Queue order is kept.
-        assert_eq!(
-            ids(&edit_queue(&queue, mv(&["e", "b"], 6))),
-            ["a", "c", "d", "f", "b", "e"]
-        );
-        assert_eq!(
-            ids(&edit_queue(&queue, mv(&["f", "c"], 1))),
-            ["a", "c", "f", "b", "d", "e"]
-        );
+        assert_eq!(ids(&mv(&["e", "b"], 6)), ["a", "c", "d", "f", "b", "e"]);
+        assert_eq!(ids(&mv(&["f", "c"], 1)), ["a", "c", "f", "b", "d", "e"]);
         // Into the middle of the selection: gathered around that point.
-        assert_eq!(
-            ids(&edit_queue(&queue, mv(&["b", "f"], 3))),
-            ["a", "c", "b", "f", "d", "e"]
-        );
+        assert_eq!(ids(&mv(&["b", "f"], 3)), ["a", "c", "b", "f", "d", "e"]);
     }
 
     #[test]
     fn stepping_keeps_gaps_and_is_all_or_nothing() {
-        let queue = Queue::Playing {
-            active: playing("a"),
-            queued: vec![
-                upcoming("b"),
-                upcoming("c"),
-                upcoming("d"),
-                upcoming("e"),
-                upcoming("f"),
-            ],
-        };
-        let step = |item_ids: &[&str], direction| QueueCommand::Step {
-            item_ids: item_ids.iter().map(|id| (*id).to_owned()).collect(),
-            direction,
-        };
+        let q = queue(&["a"], &["b", "c", "d", "e", "f"]);
+        let step = |ids: &[&str], direction| edited(&q, |q| q.step(&strings(ids), direction));
         assert_eq!(
-            ids(&edit_queue(&queue, step(&["c", "e"], Direction::Up))),
+            ids(&step(&["c", "e"], Direction::Up)),
             ["a", "c", "b", "e", "d", "f"]
         );
         assert_eq!(
-            ids(&edit_queue(&queue, step(&["c", "d"], Direction::Up))),
+            ids(&step(&["c", "d"], Direction::Up)),
             ["a", "c", "d", "b", "e", "f"]
         );
         assert_eq!(
-            ids(&edit_queue(&queue, step(&["c", "d"], Direction::Down))),
+            ids(&step(&["c", "d"], Direction::Down)),
             ["a", "b", "e", "c", "d", "f"]
         );
         // The first Upcoming item can't go above the Active Item, so nothing moves.
-        assert_eq!(edit_queue(&queue, step(&["b", "e"], Direction::Up)), queue);
-        assert_eq!(
-            edit_queue(&queue, step(&["c", "f"], Direction::Down)),
-            queue
-        );
-        assert_eq!(edit_queue(&queue, step(&["a"], Direction::Down)), queue);
+        assert_eq!(step(&["b", "e"], Direction::Up), q);
+        assert_eq!(step(&["c", "f"], Direction::Down), q);
+        assert_eq!(step(&["a"], Direction::Down), q);
     }
 
     #[test]
     fn remove_never_touches_active() {
-        let queue = Queue::Playing {
-            active: playing("a"),
-            queued: vec![upcoming("b")],
-        };
+        let q = queue(&["a"], &["b"]);
+        assert_eq!(edited(&q, |q| q.remove(&strings(&["a"]))), q);
         assert_eq!(
-            edit_queue(
-                &queue,
-                QueueCommand::Remove {
-                    item_ids: vec!["a".into()]
-                }
-            ),
-            queue
-        );
-        assert_eq!(
-            ids(&edit_queue(
-                &queue,
-                QueueCommand::Remove {
-                    item_ids: vec!["b".into(), "missing".into()]
-                }
-            )),
+            ids(&edited(&q, |q| q.remove(&strings(&["b", "missing"])))),
             ["a"]
         );
     }
