@@ -2,14 +2,14 @@
 //! output device that runs the mixer faster than real time.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::decoder::spawn_decoder;
 use crate::decoder::tests::write_wav;
-use crate::mixer::{Mixer, MixerCommand, MixerEvent, Track};
+use crate::mixer::{Mixer, MixerCommand, MixerEvent};
 use crate::output::fake::{self, FakeControls};
 use crate::{AudioEngine, AudioEvent};
 
@@ -25,19 +25,11 @@ fn engine_is_send_and_sync() {
 /// the frame count reported when it ended.
 fn play_through_mixer(path: &Path, rate: u32, channels: usize) -> u64 {
     let (mut mixer, mut handles) = Mixer::new(rate, channels);
-    let (track, producer, shared) = Track::new(1, rate, channels);
-    let cancel = Arc::new(AtomicBool::new(false));
     let failed = Arc::new(Mutex::new(None));
     let failed_slot = Arc::clone(&failed);
-    let decoder = spawn_decoder(
-        path.to_path_buf(),
-        rate,
-        channels,
-        producer,
-        shared,
-        cancel,
-        move |message| *failed_slot.lock().unwrap() = Some(message),
-    )
+    let (track, decoder) = spawn_decoder(1, path.to_path_buf(), rate, channels, move |message| {
+        *failed_slot.lock().unwrap() = Some(message)
+    })
     .unwrap();
     assert!(handles.commands.push(MixerCommand::Play(track)).is_ok());
 
