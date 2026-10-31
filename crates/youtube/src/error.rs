@@ -46,7 +46,7 @@ pub enum YoutubeError {
 
 impl YoutubeError {
     /// Extra technical context for diagnostics (already redacted).
-    pub fn detail(&self) -> Option<&str> {
+    fn detail(&self) -> Option<&str> {
         match self {
             Self::SearchFailed { detail }
             | Self::Unavailable { detail, .. }
@@ -63,7 +63,7 @@ impl YoutubeError {
     }
 
     /// HTTP status code, when the error came from the stream server.
-    pub fn status_code(&self) -> Option<u16> {
+    pub(crate) fn status_code(&self) -> Option<u16> {
         match self {
             Self::DownloadForbidden => Some(403),
             Self::DownloadHttp { status } => Some(*status),
@@ -93,6 +93,11 @@ impl YoutubeError {
             detail: redact(&error.to_string()),
         }
     }
+}
+
+/// A request failure's description, without its URL.
+pub(crate) fn http_detail(error: reqwest::Error) -> String {
+    redact(&error.without_url().to_string())
 }
 
 /// Removes anything that looks like a URL, so stream URLs (which carry

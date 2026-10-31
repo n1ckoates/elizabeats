@@ -15,7 +15,6 @@ mod cache_files;
 mod error;
 mod http_download;
 mod innertube;
-mod source;
 mod video_id;
 
 use std::collections::{HashMap, HashSet};
@@ -30,16 +29,20 @@ use elizabeats_core::{DiagnosticEvent, DiagnosticSink, DownloadCacheStatus, Sour
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
-use crate::cache::{CacheEntry, CacheState};
-use crate::cache_files::CacheFiles;
-use crate::source::{CLIENT_NAME, YoutubeSource};
-use crate::video_id::is_valid_video_id;
+use crate::cache::CacheState;
+use crate::cache_files::{CacheFiles, PartFile};
+use crate::http_download::StreamFetcher;
+use crate::innertube::{CLIENT_NAME, Innertube};
+use crate::video_id::{is_valid_video_id, parse_video_id};
 
 pub use crate::error::YoutubeError;
-pub use crate::video_id::parse_video_id;
 
 const DEFAULT_MAX_CACHE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(15);
+/// Pause between two downloads, in milliseconds (picked at random each time).
+const DOWNLOAD_GAP_MS: (u64, u64) = (5_000, 10_000);
+/// Limit for one whole download, from player request to final rename.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct YoutubeConfig {
     /// `download-cache/` lives under here.
@@ -53,46 +56,38 @@ pub struct YoutubeConfig {
 }
 
 /// The YouTube Music Source. Share it via `Arc`; every method takes `&self`.
-/// Must be used from within a tokio runtime.
+/// Must be created and used within a tokio runtime.
 pub struct YoutubeMusic {
     inner: Arc<Inner>,
-    /// Sender for the download worker, started on the first download.
-    /// Kept outside `Inner` so dropping `YoutubeMusic` stops the worker.
-    jobs: Mutex<Option<mpsc::UnboundedSender<Job>>>,
+    /// Feeds the download worker. Kept outside `Inner` (which the worker
+    /// holds) so dropping `YoutubeMusic` stops the worker.
+    jobs: mpsc::UnboundedSender<Job>,
 }
 
 impl YoutubeMusic {
-    pub fn new(config: YoutubeConfig) -> Result<Self, YoutubeError> {
-        let source = Arc::new(YoutubeSource::new(config.botguard.clone())?);
-        Ok(Self::with_parts(
-            config,
-            source.clone(),
-            source,
-            Timing::default(),
-        ))
+    pub fn new(mut config: YoutubeConfig) -> Result<Self, YoutubeError> {
+        let fetcher = Arc::new(StreamFetcher::new(config.botguard.take())?);
+        Self::with_fetcher(config, fetcher)
     }
 
-    fn with_parts(
+    fn with_fetcher(
         config: YoutubeConfig,
-        source: Arc<YoutubeSource>,
         fetcher: Arc<dyn AudioFetcher>,
-        timing: Timing,
-    ) -> Self {
-        Self {
-            inner: Arc::new(Inner {
-                files: CacheFiles::new(config.data_dir.join("download-cache")),
-                source,
-                fetcher,
-                diagnostics: config.diagnostics,
-                on_cache_change: config.on_cache_change,
-                state: Mutex::new(CacheState::new(DEFAULT_MAX_CACHE_BYTES)),
-                mutation: tokio::sync::Mutex::new(()),
-                loaded: tokio::sync::OnceCell::new(),
-                downloads: Mutex::new(HashMap::new()),
-                timing,
-            }),
-            jobs: Mutex::new(None),
-        }
+    ) -> Result<Self, YoutubeError> {
+        let inner = Arc::new(Inner {
+            files: CacheFiles::new(config.data_dir.join("download-cache")),
+            innertube: Innertube::new()?,
+            fetcher,
+            diagnostics: config.diagnostics,
+            on_cache_change: config.on_cache_change,
+            state: Mutex::new(CacheState::new(DEFAULT_MAX_CACHE_BYTES)),
+            mutation: tokio::sync::Mutex::new(()),
+            loaded: tokio::sync::OnceCell::new(),
+            downloads: Mutex::new(HashMap::new()),
+        });
+        let (jobs, receiver) = mpsc::unbounded_channel();
+        tokio::spawn(run_worker(inner.clone(), receiver));
+        Ok(Self { inner, jobs })
     }
 
     /// Loads the manifest, reconciles it with files on disk, trims to the limit.
@@ -107,8 +102,7 @@ impl YoutubeMusic {
             state.protected = protected_video_ids.into_iter().collect();
         }
         let inner = &self.inner;
-        inner.ensure_loaded().await;
-        let _guard = inner.mutation.lock().await;
+        let _guard = inner.mutate().await;
         inner
             .files
             .ensure_dir()
@@ -119,7 +113,7 @@ impl YoutubeMusic {
             .remove_stale_temp_files(&inner.in_flight())
             .await;
         inner.reconcile_locked().await;
-        inner.trim_locked().await;
+        inner.evict_locked(false).await;
         inner.persist_locked().await
     }
 
@@ -132,11 +126,11 @@ impl YoutubeMusic {
             return Ok(Vec::new());
         }
         let video_id = parse_video_id(query);
-        let source = &self.inner.source;
+        let innertube = &self.inner.innertube;
         let lookup = async {
             match &video_id {
-                Some(id) => source.track_for_video(id).await.map(|track| vec![track]),
-                None => source.search_tracks(query).await,
+                Some(id) => innertube.track_for_video(id).await.map(|track| vec![track]),
+                None => innertube.search_tracks(query).await,
             }
         };
         let result = tokio::time::timeout(SEARCH_TIMEOUT, lookup)
@@ -153,27 +147,28 @@ impl YoutubeMusic {
     /// 5–10 s gap after the previous one finished. Dropping the future does
     /// not cancel the download; it still lands in the cache.
     pub async fn resolve(&self, video_id: &str) -> Result<PathBuf, YoutubeError> {
-        let result = self.resolve_inner(video_id).await;
-        let id = is_valid_video_id(video_id).then_some(video_id);
+        let valid = is_valid_video_id(video_id);
+        let result = if valid {
+            self.resolve_valid(video_id).await
+        } else {
+            Err(YoutubeError::InvalidVideoId)
+        };
+        let id = valid.then_some(video_id);
         self.inner.record("resolve", id, result.as_ref().err());
         result
     }
 
-    async fn resolve_inner(&self, video_id: &str) -> Result<PathBuf, YoutubeError> {
-        if !is_valid_video_id(video_id) {
-            return Err(YoutubeError::InvalidVideoId);
-        }
+    async fn resolve_valid(&self, video_id: &str) -> Result<PathBuf, YoutubeError> {
         self.inner.ensure_loaded().await;
         if let Some(path) = self.inner.cached_path(video_id).await {
             return Ok(path);
         }
         let mut done = self.enqueue_download(video_id)?;
-        match done.wait_for(Option::is_some).await {
-            Ok(result) => result
-                .clone()
-                .unwrap_or(Err(YoutubeError::DownloadInterrupted)),
-            Err(_) => Err(YoutubeError::DownloadInterrupted),
-        }
+        done.wait_for(Option::is_some)
+            .await
+            .ok()
+            .and_then(|result| result.clone())
+            .unwrap_or(Err(YoutubeError::DownloadInterrupted))
     }
 
     /// Joins the in-flight download for `video_id`, or queues a new one.
@@ -182,53 +177,34 @@ impl YoutubeMusic {
         video_id: &str,
     ) -> Result<watch::Receiver<DownloadResult>, YoutubeError> {
         let mut downloads = lock(&self.inner.downloads);
-        if let Some(existing) = downloads.get(video_id) {
-            // A closed channel means its worker is gone; start over below.
-            if existing.has_changed().is_ok() {
-                return Ok(existing.clone());
-            }
+        // A closed channel means its job was dropped; queue a new one.
+        if let Some(existing) = downloads.get(video_id)
+            && existing.has_changed().is_ok()
+        {
+            return Ok(existing.clone());
         }
-        let (done_tx, done_rx) = watch::channel(None);
-        let mut job = Job {
+        let (done, receiver) = watch::channel(None);
+        let job = Job {
             video_id: video_id.to_owned(),
-            done: done_tx,
+            done,
         };
-        let mut jobs = lock(&self.jobs);
-        if let Some(sender) = jobs.as_ref() {
-            match sender.send(job) {
-                Ok(()) => {
-                    downloads.insert(video_id.to_owned(), done_rx.clone());
-                    return Ok(done_rx);
-                }
-                Err(mpsc::error::SendError(returned)) => job = returned,
-            }
-        }
-        // First download (or the worker stopped): start a worker.
-        let (sender, receiver) = mpsc::unbounded_channel();
-        tokio::spawn(run_worker(self.inner.clone(), receiver));
-        sender
+        self.jobs
             .send(job)
             .map_err(|_| YoutubeError::DownloadInterrupted)?;
-        *jobs = Some(sender);
-        downloads.insert(video_id.to_owned(), done_rx.clone());
-        Ok(done_rx)
+        downloads.insert(video_id.to_owned(), receiver.clone());
+        Ok(receiver)
     }
 
     /// Gets search ready in the background (client version, connection), so
     /// the first search after launch is as fast as later ones. Call within a
     /// tokio runtime; failures are ignored (the first search retries).
     pub fn prewarm(&self) {
-        let source = self.inner.source.clone();
-        tokio::spawn(async move { source.warm_up().await });
+        let inner = self.inner.clone();
+        tokio::spawn(async move { inner.innertube.warm_up().await });
     }
 
     pub fn cache_status(&self) -> DownloadCacheStatus {
-        let state = lock(&self.inner.state);
-        DownloadCacheStatus {
-            used_bytes: state.used_bytes(),
-            max_bytes: state.max_bytes,
-            pending_clear_count: state.pending_clear_count(),
-        }
+        lock(&self.inner.state).status()
     }
 
     /// Video IDs with audio in the Download Cache.
@@ -251,14 +227,13 @@ impl YoutubeMusic {
     /// videos, which are removed as soon as they stop being protected.
     pub async fn clear_download_cache(&self) -> Result<(), YoutubeError> {
         let inner = &self.inner;
-        inner.ensure_loaded().await;
-        let _guard = inner.mutation.lock().await;
+        let _guard = inner.mutate().await;
         for entry in lock(&inner.state).entries.values_mut() {
             if entry.file_name.is_some() {
                 entry.clear_requested = true;
             }
         }
-        inner.trim_locked().await;
+        inner.evict_locked(false).await;
         inner.persist_locked().await
     }
 
@@ -268,14 +243,10 @@ impl YoutubeMusic {
             return Err(YoutubeError::InvalidVideoId);
         }
         let inner = &self.inner;
-        inner.ensure_loaded().await;
-        let _guard = inner.mutation.lock().await;
+        let _guard = inner.mutate().await;
         {
             let mut state = lock(&inner.state);
-            let entry = state
-                .entries
-                .entry(video_id.to_owned())
-                .or_insert_with(|| CacheEntry::new(video_id));
+            let entry = state.entry(video_id);
             entry.play_count = entry.play_count.saturating_add(1);
         }
         inner.persist_locked().await
@@ -290,40 +261,14 @@ impl YoutubeMusic {
 type DownloadResult = Option<Result<PathBuf, YoutubeError>>;
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Audio that a fetcher has written (atomically) into the cache directory.
-pub(crate) struct FetchedAudio {
-    pub file_name: String,
-    pub byte_size: u64,
-    /// How the audio was fetched (for logs).
-    pub client_type: String,
-}
-
-/// Downloads one video's audio into the cache directory. Behind a trait so
-/// the queue can be tested without the network.
+/// Writes one video's audio into `part`, which the cache then moves into
+/// place. Behind a trait so the queue can be tested without the network.
 pub(crate) trait AudioFetcher: Send + Sync {
     fn fetch<'a>(
         &'a self,
         video_id: &'a str,
-        files: &'a CacheFiles,
-    ) -> BoxFuture<'a, Result<FetchedAudio, YoutubeError>>;
-}
-
-#[derive(Clone, Debug)]
-struct Timing {
-    min_gap: Duration,
-    max_gap: Duration,
-    /// Limit for one whole download, from player request to final rename.
-    download_timeout: Duration,
-}
-
-impl Default for Timing {
-    fn default() -> Self {
-        Self {
-            min_gap: Duration::from_secs(5),
-            max_gap: Duration::from_secs(10),
-            download_timeout: Duration::from_secs(120),
-        }
-    }
+        part: &'a mut PartFile,
+    ) -> BoxFuture<'a, Result<(), YoutubeError>>;
 }
 
 struct Job {
@@ -333,7 +278,7 @@ struct Job {
 
 struct Inner {
     files: CacheFiles,
-    source: Arc<YoutubeSource>,
+    innertube: Innertube,
     fetcher: Arc<dyn AudioFetcher>,
     diagnostics: DiagnosticSink,
     on_cache_change: Arc<dyn Fn() + Send + Sync>,
@@ -345,14 +290,13 @@ struct Inner {
     loaded: tokio::sync::OnceCell<()>,
     /// Downloads queued or running, keyed by video ID.
     downloads: Mutex<HashMap<String, watch::Receiver<DownloadResult>>>,
-    timing: Timing,
 }
 
 /// Processes download jobs strictly one at a time, in order.
 async fn run_worker(inner: Arc<Inner>, mut jobs: mpsc::UnboundedReceiver<Job>) {
     let mut last_finished: Option<Instant> = None;
     while let Some(job) = jobs.recv().await {
-        let result = inner.run_job(&job.video_id, &mut last_finished).await;
+        let result = inner.download(&job.video_id, &mut last_finished).await;
         lock(&inner.downloads).remove(&job.video_id);
         // Evictions skipped while this video was downloading can happen now.
         if let Err(error) = inner.trim_and_persist().await {
@@ -364,7 +308,7 @@ async fn run_worker(inner: Arc<Inner>, mut jobs: mpsc::UnboundedReceiver<Job>) {
 }
 
 impl Inner {
-    async fn run_job(
+    async fn download(
         &self,
         video_id: &str,
         last_finished: &mut Option<Instant>,
@@ -373,14 +317,12 @@ impl Inner {
             return Ok(path);
         }
         if let Some(last) = *last_finished {
-            let gap_ms = random_between(
-                u64::try_from(self.timing.min_gap.as_millis()).unwrap_or(u64::MAX),
-                u64::try_from(self.timing.max_gap.as_millis()).unwrap_or(u64::MAX),
-            );
-            tokio::time::sleep_until(last + Duration::from_millis(gap_ms)).await;
+            let gap = random_between(DOWNLOAD_GAP_MS.0, DOWNLOAD_GAP_MS.1);
+            tokio::time::sleep_until(last + Duration::from_millis(gap)).await;
         }
         let started = Instant::now();
-        let mut fetched = self.fetch_with_timeout(video_id).await;
+        let file_name = format!("{video_id}.m4a");
+        let mut fetched = self.fetch(video_id, &file_name).await;
         // Out of disk space: make room by evicting cached Tracks nothing needs
         // right now, then try once more.
         if matches!(fetched, Err(YoutubeError::DiskFull)) && self.evict_everything_evictable().await
@@ -388,87 +330,57 @@ impl Inner {
             tracing::warn!(
                 "disk full while downloading {video_id}; freed cache space and retrying"
             );
-            fetched = self.fetch_with_timeout(video_id).await;
+            fetched = self.fetch(video_id, &file_name).await;
         }
         *last_finished = Some(Instant::now());
-        let fetched = fetched?;
+        let byte_size = fetched?;
         tracing::info!(
-            "downloaded {video_id} ({} bytes, {} client) in {:.1} s",
-            fetched.byte_size,
-            fetched.client_type,
+            "downloaded {video_id} ({byte_size} bytes) in {:.1} s",
             started.elapsed().as_secs_f64()
         );
-        self.register_download(video_id, &fetched).await
+        let path = self.files.path(&file_name).map_err(YoutubeError::cache)?;
+        let _guard = self.mutate().await;
+        lock(&self.state).set_audio(video_id, file_name, byte_size);
+        self.evict_locked(false).await;
+        // The audio is safely on disk; a manifest write failure is reported but
+        // doesn't fail the download (initialize would adopt the file anyway).
+        self.persist_or_record(Some(video_id)).await;
+        Ok(path)
     }
 
-    async fn fetch_with_timeout(&self, video_id: &str) -> Result<FetchedAudio, YoutubeError> {
-        tokio::time::timeout(
-            self.timing.download_timeout,
-            self.fetcher.fetch(video_id, &self.files),
-        )
-        .await
-        .unwrap_or(Err(YoutubeError::DownloadTimedOut))
+    /// Fetches the audio into `file_name` (atomically, through a `.part`
+    /// file), returning its size.
+    async fn fetch(&self, video_id: &str, file_name: &str) -> Result<u64, YoutubeError> {
+        let attempt = async {
+            let mut part = self
+                .files
+                .begin(file_name)
+                .await
+                .map_err(YoutubeError::cache_write)?;
+            self.fetcher.fetch(video_id, &mut part).await?;
+            part.finish().await.map_err(|error| {
+                if error.kind() == std::io::ErrorKind::InvalidData {
+                    YoutubeError::EmptyDownload
+                } else {
+                    YoutubeError::cache_write(error)
+                }
+            })
+        };
+        tokio::time::timeout(DOWNLOAD_TIMEOUT, attempt)
+            .await
+            .unwrap_or(Err(YoutubeError::DownloadTimedOut))
     }
 
     /// Deletes every cached file that isn't protected (Playing or in the
     /// Queue) or downloading, regardless of the cache size limit. Returns
     /// whether anything was deleted.
     async fn evict_everything_evictable(&self) -> bool {
-        self.ensure_loaded().await;
-        let _guard = self.mutation.lock().await;
-        let candidates = lock(&self.state).eviction_candidates(&self.in_flight());
-        let mut evicted = false;
-        for candidate in candidates {
-            let Some(file_name) = candidate.file_name.as_deref() else {
-                continue;
-            };
-            match self.files.remove(file_name).await {
-                Ok(()) => {
-                    evicted = true;
-                    if let Some(entry) = lock(&self.state).entries.get_mut(&candidate.video_id) {
-                        entry.remove_audio();
-                    }
-                }
-                Err(error) => {
-                    let error = YoutubeError::cache(error);
-                    self.record("cache-remove", Some(&candidate.video_id), Some(&error));
-                }
-            }
-        }
-        if evicted && let Err(error) = self.persist_locked().await {
-            self.record("cache-write", None, Some(&error));
+        let _guard = self.mutate().await;
+        let evicted = self.evict_locked(true).await;
+        if evicted {
+            self.persist_or_record(None).await;
         }
         evicted
-    }
-
-    async fn register_download(
-        &self,
-        video_id: &str,
-        fetched: &FetchedAudio,
-    ) -> Result<PathBuf, YoutubeError> {
-        let path = self
-            .files
-            .path(&fetched.file_name)
-            .map_err(YoutubeError::cache)?;
-        let _guard = self.mutation.lock().await;
-        {
-            let mut state = lock(&self.state);
-            let entry = state
-                .entries
-                .entry(video_id.to_owned())
-                .or_insert_with(|| CacheEntry::new(video_id));
-            entry.file_name = Some(fetched.file_name.clone());
-            entry.byte_size = Some(fetched.byte_size);
-            entry.downloaded_at = Some(cache::now_timestamp());
-            entry.clear_requested = false;
-        }
-        self.trim_locked().await;
-        // The audio is safely on disk; a manifest write failure is reported but
-        // doesn't fail the download (initialize would adopt the file anyway).
-        if let Err(error) = self.persist_locked().await {
-            self.record("cache-write", Some(video_id), Some(&error));
-        }
-        Ok(path)
     }
 
     /// Loads the manifest once. Every cache operation waits for this, so a
@@ -487,6 +399,12 @@ impl Inner {
             .await;
     }
 
+    /// Waits for the manifest to be loaded, then takes the mutation lock.
+    async fn mutate(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.ensure_loaded().await;
+        self.mutation.lock().await
+    }
+
     /// The cached file for `video_id` if it is really on disk. Fixes up the
     /// manifest when the file vanished or changed size.
     async fn cached_path(&self, video_id: &str) -> Option<PathBuf> {
@@ -497,32 +415,34 @@ impl Inner {
         if !known {
             return None;
         }
-        let _guard = self.mutation.lock().await;
+        let _guard = self.mutate().await;
         let (file_name, recorded_size) = {
             let state = lock(&self.state);
             let entry = state.entries.get(video_id)?;
             (entry.file_name.clone()?, entry.byte_size)
         };
-        let size = if is_playable_file(&file_name) {
-            self.files.size(&file_name).await.filter(|size| *size > 0)
-        } else {
-            // Opus/WebM from the Electron app: our audio engine can't play it.
-            let _ = self.files.remove(&file_name).await;
-            None
-        };
+        let size = self.audio_size(&file_name).await;
         if size != recorded_size {
-            if let Some(entry) = lock(&self.state).entries.get_mut(video_id) {
-                match size {
-                    Some(size) => entry.byte_size = Some(size),
-                    None => entry.remove_audio(),
-                }
-            }
-            if let Err(error) = self.persist_locked().await {
-                self.record("cache-write", Some(video_id), Some(&error));
-            }
+            lock(&self.state).set_size(video_id, size);
+            self.persist_or_record(Some(video_id)).await;
         }
         size?;
         self.files.path(&file_name).ok()
+    }
+
+    /// The size of a cached audio file that is on disk, not empty and
+    /// playable. Anything else is deleted (Opus/WebM from the Electron app
+    /// can't be played by our audio engine, which only plays AAC in MP4).
+    async fn audio_size(&self, file_name: &str) -> Option<u64> {
+        let size = if file_name.ends_with(".m4a") {
+            self.files.size(file_name).await.filter(|size| *size > 0)
+        } else {
+            None
+        };
+        if size.is_none() {
+            let _ = self.files.remove(file_name).await;
+        }
+        size
     }
 
     /// Makes the manifest match the disk (call with the mutation lock held):
@@ -535,48 +455,23 @@ impl Inner {
             .values()
             .filter_map(|entry| Some((entry.video_id.clone(), entry.file_name.clone()?)))
             .collect();
+        let mut known = HashSet::new();
         for (video_id, file_name) in with_files {
-            let size = if is_playable_file(&file_name) {
-                self.files.size(&file_name).await.filter(|size| *size > 0)
-            } else {
-                None
-            };
-            if size.is_none() {
-                // Missing, empty or unplayable: make sure nothing is left behind.
-                let _ = self.files.remove(&file_name).await;
-            }
-            if let Some(entry) = lock(&self.state).entries.get_mut(&video_id) {
-                match size {
-                    Some(size) => entry.byte_size = Some(size),
-                    None => entry.remove_audio(),
-                }
+            let size = self.audio_size(&file_name).await;
+            lock(&self.state).set_size(&video_id, size);
+            if size.is_some() {
+                known.insert(file_name);
             }
         }
-
-        let known: HashSet<String> = lock(&self.state)
-            .entries
-            .values()
-            .filter_map(|entry| entry.file_name.clone())
-            .collect();
         for (file_name, size) in self.files.list_audio_files().await {
             if known.contains(&file_name) {
                 continue;
             }
             let adoptable = file_name
                 .strip_suffix(".m4a")
-                .filter(|id| is_valid_video_id(id));
-            match adoptable.filter(|_| size > 0) {
-                Some(video_id) => {
-                    let mut state = lock(&self.state);
-                    let entry = state
-                        .entries
-                        .entry(video_id.to_owned())
-                        .or_insert_with(|| CacheEntry::new(video_id));
-                    entry.file_name = Some(file_name.clone());
-                    entry.byte_size = Some(size);
-                    entry.downloaded_at = Some(cache::now_timestamp());
-                    entry.clear_requested = false;
-                }
+                .filter(|id| size > 0 && is_valid_video_id(id));
+            match adoptable {
+                Some(video_id) => lock(&self.state).set_audio(video_id, file_name.clone(), size),
                 None => {
                     let _ = self.files.remove(&file_name).await;
                 }
@@ -585,16 +480,16 @@ impl Inner {
     }
 
     async fn trim_and_persist(&self) -> Result<(), YoutubeError> {
-        self.ensure_loaded().await;
-        let _guard = self.mutation.lock().await;
-        self.trim_locked().await;
+        let _guard = self.mutate().await;
+        self.evict_locked(false).await;
         self.persist_locked().await
     }
 
-    /// Evicts files until the cache fits (call with the mutation lock held).
-    /// Clear-requested files go regardless of size. Protected and in-flight
-    /// videos are never evicted.
-    async fn trim_locked(&self) {
+    /// Deletes cached files (call with the mutation lock held): clear-requested
+    /// ones, then others in eviction order until the cache fits, or with
+    /// `everything` all of them. Protected and in-flight videos are never
+    /// evicted. Returns whether anything was deleted.
+    async fn evict_locked(&self, everything: bool) -> bool {
         let in_flight = self.in_flight();
         let (candidates, mut used, max) = {
             let state = lock(&self.state);
@@ -604,8 +499,9 @@ impl Inner {
                 state.max_bytes,
             )
         };
+        let mut evicted = false;
         for candidate in candidates {
-            if !candidate.clear_requested && used <= max {
+            if !everything && !candidate.clear_requested && used <= max {
                 continue;
             }
             let Some(file_name) = candidate.file_name.as_deref() else {
@@ -613,10 +509,9 @@ impl Inner {
             };
             match self.files.remove(file_name).await {
                 Ok(()) => {
+                    evicted = true;
                     used = used.saturating_sub(candidate.byte_size.unwrap_or(0));
-                    if let Some(entry) = lock(&self.state).entries.get_mut(&candidate.video_id) {
-                        entry.remove_audio();
-                    }
+                    lock(&self.state).set_size(&candidate.video_id, None);
                 }
                 Err(error) => {
                     let error = YoutubeError::cache(error);
@@ -624,23 +519,25 @@ impl Inner {
                 }
             }
         }
+        evicted
     }
 
     /// Writes the manifest and notifies the app (call with the mutation lock held).
     async fn persist_locked(&self) -> Result<(), YoutubeError> {
-        let json = lock(&self.state)
-            .manifest_json()
-            .map_err(YoutubeError::cache);
+        let json = lock(&self.state).manifest_json();
         let result = match json {
-            Ok(json) => self
-                .files
-                .write_manifest(&json)
-                .await
-                .map_err(YoutubeError::cache),
-            Err(error) => Err(error),
+            Ok(json) => self.files.write_manifest(&json).await,
+            Err(error) => Err(error.into()),
         };
         (self.on_cache_change)();
-        result
+        result.map_err(YoutubeError::cache)
+    }
+
+    /// [`Self::persist_locked`], recording a failure in diagnostics.
+    async fn persist_or_record(&self, video_id: Option<&str>) {
+        if let Err(error) = self.persist_locked().await {
+            self.record("cache-write", video_id, Some(&error));
+        }
     }
 
     fn in_flight(&self) -> HashSet<String> {
@@ -660,11 +557,6 @@ impl Inner {
         }
         (self.diagnostics)(event);
     }
-}
-
-/// Only AAC in MP4 is playable by our audio engine.
-fn is_playable_file(file_name: &str) -> bool {
-    file_name.ends_with(".m4a")
 }
 
 /// Locks a std mutex, recovering the data if another thread panicked while holding it.

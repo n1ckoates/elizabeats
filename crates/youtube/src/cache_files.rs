@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 
 use tokio::io::AsyncWriteExt;
 
-pub(crate) const MANIFEST_FILE: &str = "manifest.json";
+use crate::video_id::is_id_byte;
+
+const MANIFEST_FILE: &str = "manifest.json";
 const PART_SUFFIX: &str = ".part";
 const TEMP_SUFFIX: &str = ".tmp";
 
@@ -28,11 +30,7 @@ pub(crate) fn is_valid_audio_file_name(name: &str) -> bool {
     let Some((stem, extension)) = name.rsplit_once('.') else {
         return false;
     };
-    !stem.is_empty()
-        && stem
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-        && AUDIO_EXTENSIONS.contains(&extension)
+    !stem.is_empty() && stem.bytes().all(is_id_byte) && AUDIO_EXTENSIONS.contains(&extension)
 }
 
 impl CacheFiles {

@@ -10,17 +10,19 @@ use std::time::Duration;
 use elizabeats_core::{SourceId, Track};
 use serde_json::{Value, json};
 
-use crate::error::{YoutubeError, redact};
+use crate::error::{YoutubeError, http_detail};
+use crate::http_download::http_client;
 use crate::video_id::is_valid_video_id;
 
+/// Name recorded in diagnostics for search and lookup requests.
+pub(crate) const CLIENT_NAME: &str = "innertube";
 const ORIGIN: &str = "https://music.youtube.com";
 /// Search params for YouTube Music's "Songs" filter.
 const SONGS_FILTER: &str = "EgWKAQIIAWoKEAoQAxAEEAkQBQ==";
 /// Used when the current version can't be read from music.youtube.com.
 const FALLBACK_CLIENT_VERSION: &str = "1.20261006.10.00";
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-pub(crate) const MAX_SEARCH_RESULTS: usize = 20;
+const MAX_SEARCH_RESULTS: usize = 20;
 
 pub(crate) struct Innertube {
     http: reqwest::Client,
@@ -30,16 +32,13 @@ pub(crate) struct Innertube {
 
 impl Innertube {
     pub(crate) fn new() -> Result<Self, YoutubeError> {
-        let http = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .map_err(|error| YoutubeError::Client {
-                detail: redact(&error.without_url().to_string()),
-            })?;
         Ok(Self {
-            http,
+            http: http_client(
+                reqwest::Client::builder()
+                    .user_agent(USER_AGENT)
+                    .connect_timeout(Duration::from_secs(10))
+                    .timeout(Duration::from_secs(15)),
+            )?,
             client_version: tokio::sync::OnceCell::new(),
         })
     }
@@ -112,7 +111,7 @@ impl Innertube {
             .body(body.to_string())
             .send()
             .await
-            .map_err(|error| redact(&error.without_url().to_string()))?;
+            .map_err(http_detail)?;
         let status = response.status();
         if !status.is_success() {
             return Err(format!("{endpoint}: HTTP {}", status.as_u16()));
@@ -120,7 +119,7 @@ impl Innertube {
         let text = response
             .text()
             .await
-            .map_err(|error| format!("{endpoint}: {}", redact(&error.without_url().to_string())))?;
+            .map_err(|error| format!("{endpoint}: {}", http_detail(error)))?;
         serde_json::from_str(&text).map_err(|error| format!("{endpoint}: invalid JSON ({error})"))
     }
 }
@@ -142,18 +141,15 @@ fn text(value: &Value) -> Option<&str> {
         .filter(|text| !text.is_empty())
 }
 
-fn runs(value: &Value) -> Vec<&Value> {
-    value["runs"]
-        .as_array()
-        .map(|runs| runs.iter().collect())
-        .unwrap_or_default()
+fn runs(value: &Value) -> impl DoubleEndedIterator<Item = &Value> {
+    value["runs"].as_array().into_iter().flatten()
 }
 
-/// Text runs that carry content (not the " • " separators).
-fn meaningful_runs(value: &Value) -> Vec<&Value> {
+/// The texts of runs that carry content (not the " • " separators).
+fn run_texts(value: &Value) -> Vec<(&Value, &str)> {
     runs(value)
-        .into_iter()
-        .filter(|run| text(&run["text"]).is_some_and(|text| text != "•"))
+        .filter_map(|run| Some((run, text(&run["text"])?)))
+        .filter(|(_, text)| *text != "•")
         .collect()
 }
 
@@ -206,33 +202,38 @@ fn artwork(thumbnails: &Value) -> Option<String> {
 }
 
 /// Artist, album and duration from a byline like `Artist • Album • 3:21`.
-struct Byline {
-    artist: Option<String>,
-    album: Option<String>,
+#[derive(Default)]
+struct Byline<'a> {
+    artist: Option<&'a str>,
+    album: Option<&'a str>,
     duration: Option<f64>,
 }
 
-fn byline(value: &Value) -> Byline {
-    let runs = meaningful_runs(value);
-    let artist = runs
-        .iter()
-        .find(|run| page_type(run).contains("ARTIST"))
-        .or_else(|| runs.first())
-        .and_then(|run| text(&run["text"]))
-        .map(str::to_owned);
-    let album = runs
-        .iter()
-        .find(|run| page_type(run).contains("ALBUM"))
-        .and_then(|run| text(&run["text"]))
-        .map(str::to_owned);
-    let duration = runs
-        .iter()
-        .rev()
-        .find_map(|run| text(&run["text"]).and_then(parse_duration));
+fn byline(value: &Value) -> Byline<'_> {
+    let runs = run_texts(value);
+    let with_page_type = |kind: &str| {
+        runs.iter()
+            .find(|(run, _)| page_type(run).contains(kind))
+            .map(|(_, text)| *text)
+    };
     Byline {
-        artist,
-        album,
-        duration,
+        artist: with_page_type("ARTIST").or_else(|| runs.first().map(|(_, text)| *text)),
+        album: with_page_type("ALBUM"),
+        duration: runs.iter().rev().find_map(|(_, text)| parse_duration(text)),
+    }
+}
+
+/// A Track from a search result or play queue `item`.
+fn song(id: &str, title: &str, byline: Byline<'_>, item: &Value, thumbnails: &Value) -> Track {
+    Track {
+        id: id.to_owned(),
+        source: SourceId::YoutubeMusic,
+        title: title.to_owned(),
+        artist: byline.artist.unwrap_or("Unknown artist").to_owned(),
+        album: byline.album.map(str::to_owned),
+        duration_seconds: byline.duration,
+        artwork_url: artwork(thumbnails),
+        explicit: is_explicit(&item["badges"]),
     }
 }
 
@@ -243,29 +244,15 @@ fn search_item(item: &Value) -> Option<Track> {
             .get(index)
             .map(|column| &column["musicResponsiveListItemFlexColumnRenderer"]["text"])
     };
-    let title_run = runs(column(0)?).into_iter().next()?;
+    let title_run = runs(column(0)?).next()?;
     let id = title_run["navigationEndpoint"]["watchEndpoint"]["videoId"].as_str()?;
     let title = text(&title_run["text"])?;
     if !is_valid_video_id(id) {
         return None;
     }
-    let byline = column(1).map(byline).unwrap_or(Byline {
-        artist: None,
-        album: None,
-        duration: None,
-    });
-    Some(Track {
-        id: id.to_owned(),
-        source: SourceId::YoutubeMusic,
-        title: title.to_owned(),
-        artist: byline.artist.unwrap_or_else(|| "Unknown artist".to_owned()),
-        album: byline.album,
-        duration_seconds: byline.duration,
-        artwork_url: artwork(
-            &item["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"],
-        ),
-        explicit: is_explicit(&item["badges"]),
-    })
+    let byline = column(1).map(byline).unwrap_or_default();
+    let thumbnails = &item["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"];
+    Some(song(id, title, byline, item, thumbnails))
 }
 
 /// Visits every object under `value` named `key`, depth first.
@@ -313,24 +300,19 @@ pub(crate) fn parse_next(response: &Value, video_id: &str) -> Option<Track> {
     let item = items
         .into_iter()
         .find(|item| item["videoId"].as_str() == Some(video_id))?;
-    let title = meaningful_runs(&item["title"])
+    let (_, title) = *run_texts(&item["title"]).first()?;
+    let mut byline = byline(&item["longBylineText"]);
+    let length = run_texts(&item["lengthText"])
         .into_iter()
-        .find_map(|run| text(&run["text"]))?;
-    let byline = byline(&item["longBylineText"]);
-    let duration = meaningful_runs(&item["lengthText"])
-        .into_iter()
-        .find_map(|run| text(&run["text"]).and_then(parse_duration))
-        .or(byline.duration);
-    Some(Track {
-        id: video_id.to_owned(),
-        source: SourceId::YoutubeMusic,
-        title: title.to_owned(),
-        artist: byline.artist.unwrap_or_else(|| "Unknown artist".to_owned()),
-        album: byline.album,
-        duration_seconds: duration,
-        artwork_url: artwork(&item["thumbnail"]["thumbnails"]),
-        explicit: is_explicit(&item["badges"]),
-    })
+        .find_map(|(_, text)| parse_duration(text));
+    byline.duration = length.or(byline.duration);
+    Some(song(
+        video_id,
+        title,
+        byline,
+        item,
+        &item["thumbnail"]["thumbnails"],
+    ))
 }
 
 /// Fallback metadata from a `player` response's video details.
@@ -453,39 +435,6 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-
-    /// Live timing of search: `cargo test --release -p elizabeats-youtube
-    /// search_timing -- --ignored --nocapture`.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "needs network"]
-    async fn search_timing() {
-        let innertube = Innertube::new().unwrap();
-        let started = std::time::Instant::now();
-        let version = innertube.fetch_client_version().await;
-        println!(
-            "client version page: {:>4} ms ({version:?})",
-            started.elapsed().as_millis()
-        );
-        // As in the app: warm up at launch, then the DJ types a query.
-        let innertube = Innertube::new().unwrap();
-        innertube.warm_up().await;
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        for query in [
-            "daft punk one more time",
-            "kendrick lamar humble",
-            "taylor swift",
-            "olivia rodrigo good 4 u",
-            "macklemore thrift shop",
-        ] {
-            let started = std::time::Instant::now();
-            let tracks = innertube.search_tracks(query).await.unwrap();
-            println!(
-                "{query:<26} {:>4} ms ({} tracks)",
-                started.elapsed().as_millis(),
-                tracks.len()
-            );
-        }
-    }
 
     fn run(text: &str, page_type: Option<&str>) -> Value {
         match page_type {
