@@ -235,23 +235,29 @@ impl Queue {
     /// Moves each of these items one place, keeping the gaps between them.
     /// Does nothing if any of them is already at the end it moves toward.
     pub fn step(&mut self, ids: &[String], direction: Direction) {
-        let selected: Vec<bool> = self
-            .upcoming
-            .iter()
-            .map(|item| ids.contains(&item.id))
+        let len = self.upcoming.len();
+        let positions: Vec<usize> = (0..len)
+            .filter(|&i| ids.contains(&self.upcoming[i].id))
             .collect();
-        let len = selected.len();
-        // Each selected item swaps with its neighbour; walking from the
-        // leading end moves adjacent selected items along as a block.
+        // Each selected item swaps with its neighbour, starting from the end
+        // it moves toward, so adjacent selected items move along as a block.
         match direction {
-            Direction::Up if selected.first() != Some(&true) => (1..len)
-                .filter(|&i| selected[i])
-                .for_each(|i| self.upcoming.swap(i - 1, i)),
-            Direction::Down if selected.last() != Some(&true) => (0..len.saturating_sub(1))
-                .rev()
-                .filter(|&i| selected[i])
-                .for_each(|i| self.upcoming.swap(i, i + 1)),
-            _ => {}
+            Direction::Up => {
+                if positions.first() == Some(&0) {
+                    return;
+                }
+                for i in positions {
+                    self.upcoming.swap(i - 1, i);
+                }
+            }
+            Direction::Down => {
+                if positions.last().is_some_and(|&i| i + 1 == len) {
+                    return;
+                }
+                for i in positions.into_iter().rev() {
+                    self.upcoming.swap(i, i + 1);
+                }
+            }
         }
     }
 

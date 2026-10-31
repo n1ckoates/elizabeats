@@ -105,10 +105,12 @@ pub struct Launch {
 /// Creates the data directory and all long-lived services.
 pub fn bootstrap(launch: Launch) -> Result<StationParts, String> {
     let data_dir = match launch.data_dir {
-        Some(dir) => std::fs::create_dir_all(&dir).map(|()| dir),
-        None => elizabeats_store::data_dir().map_err(std::io::Error::other),
-    }
-    .map_err(|error| error.to_string())?;
+        Some(dir) => {
+            std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+            dir
+        }
+        None => elizabeats_store::data_dir().map_err(|error| error.to_string())?,
+    };
     let settings = elizabeats_store::load_settings(&data_dir);
     elizabeats_store::remove_stale_temp_files(&data_dir);
 

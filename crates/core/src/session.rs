@@ -186,7 +186,10 @@ impl Session {
 
     /// Breaks are always ready; Playing items are ready by definition.
     pub fn readiness(&self, item: QueueItemRef<'_>) -> Readiness {
-        let (QueueItemRef::Upcoming(_), Some(track)) = (item, item.track()) else {
+        if !matches!(item, QueueItemRef::Upcoming(_)) {
+            return Readiness::Ready;
+        }
+        let Some(track) = item.track() else {
             return Readiness::Ready;
         };
         match self.preparations.get(&track.key()) {
@@ -280,14 +283,21 @@ impl Session {
             Playback::Stopped { .. } => {}
             Playback::Crossfading { .. } => self.promote_incoming(PlayLogReason::Skipped, true),
             Playback::Playing { .. } => {
-                let next = self.queue.upcoming.first();
-                let next_track =
-                    next.and_then(|next| Some((next.id.clone(), next.as_track()?.key())));
+                // Crossfade when a Track follows a Track; otherwise stop and
+                // move on (into a Break, or to the end of the Queue).
+                let next_track = self
+                    .queue
+                    .upcoming
+                    .first()
+                    .filter(|next| next.as_track().is_some())
+                    .cloned();
                 match next_track {
-                    Some((next_id, key)) if self.active_track_playing() => {
-                        self.retry_if_failed(&key);
+                    Some(next) if self.active_track_playing() => {
+                        if let Some(track) = next.as_track() {
+                            self.retry_if_failed(&track.key());
+                        }
                         self.playback_error = None;
-                        self.crossfade_to(&next_id);
+                        self.crossfade_to(&next.id);
                     }
                     _ => {
                         self.audio(AudioCommand::Stop);

@@ -165,8 +165,8 @@ impl SettingsView {
         });
     }
 
-    /// Runs `work` with the buttons disabled, then shows its error (if any)
-    /// in the `error` slot.
+    /// Runs `work` with the buttons disabled, then shows its error (if any).
+    /// `error` picks where the message goes, e.g. `|errors| &mut errors.library`.
     fn run_busy(
         &mut self,
         cx: &mut Context<Self>,
@@ -190,12 +190,17 @@ impl SettingsView {
     /// Asks before a destructive action, then runs `action`.
     fn confirm(
         &mut self,
-        (title, description, ok_text): (&'static str, &'static str, &'static str),
+        confirmation: &Confirmation,
         action: fn(&mut Self, &mut Context<Self>),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let view = cx.entity().downgrade();
+        let &Confirmation {
+            title,
+            description,
+            ok_text,
+        } = confirmation;
         window.open_alert_dialog(cx, move |alert: AlertDialog, _, _| {
             let view = view.clone();
             alert
@@ -213,17 +218,24 @@ impl SettingsView {
     }
 }
 
-const CLEAR_LOG: (&str, &str, &str) = (
-    "Clear the complete play log?",
-    "This removes the saved history. The action cannot be undone.",
-    "Clear Play Log",
-);
+/// The wording of a "are you sure?" dialog.
+struct Confirmation {
+    title: &'static str,
+    description: &'static str,
+    ok_text: &'static str,
+}
 
-const CLEAR_CACHE: (&str, &str, &str) = (
-    "Clear the download cache?",
-    "Tracks currently playing or in the queue will be removed after they are no longer needed. Play counts will be kept.",
-    "Clear Download Cache",
-);
+const CLEAR_LOG: Confirmation = Confirmation {
+    title: "Clear the complete play log?",
+    description: "This removes the saved history. The action cannot be undone.",
+    ok_text: "Clear Play Log",
+};
+
+const CLEAR_CACHE: Confirmation = Confirmation {
+    title: "Clear the download cache?",
+    description: "Tracks currently playing or in the queue will be removed after they are no longer needed. Play counts will be kept.",
+    ok_text: "Clear Download Cache",
+};
 
 /// A click handler that runs `action` on the Settings view.
 fn on_view(
@@ -394,7 +406,7 @@ impl Render for SettingsView {
                                     .label("Clear Log")
                                     .disabled(log_count == 0 || busy)
                                     .on_click(on_view(&log_view, |this, window, cx| {
-                                        this.confirm(CLEAR_LOG, Self::clear_log, window, cx)
+                                        this.confirm(&CLEAR_LOG, Self::clear_log, window, cx)
                                     }))
                             }),
                         )
@@ -418,7 +430,7 @@ impl Render for SettingsView {
                                     .label("Clear Cache")
                                     .disabled(cache.used_bytes == 0 || busy)
                                     .on_click(on_view(&cache_view, |this, window, cx| {
-                                        this.confirm(CLEAR_CACHE, Self::clear_cache, window, cx)
+                                        this.confirm(&CLEAR_CACHE, Self::clear_cache, window, cx)
                                     }))
                             }),
                         )
