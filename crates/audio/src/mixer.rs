@@ -49,13 +49,6 @@ pub(crate) struct TrackShared {
 const UNKNOWN_DURATION: u64 = u64::MAX;
 
 impl TrackShared {
-    fn new() -> Self {
-        Self {
-            finished: AtomicBool::new(false),
-            duration_bits: AtomicU64::new(UNKNOWN_DURATION),
-        }
-    }
-
     pub(crate) fn set_duration(&self, secs: Option<f64>) {
         let bits = match secs {
             Some(secs) if secs.is_finite() && secs >= 0.0 => secs.to_bits(),
@@ -64,7 +57,7 @@ impl TrackShared {
         self.duration_bits.store(bits, Ordering::Relaxed);
     }
 
-    pub(crate) fn duration_secs(&self) -> Option<f64> {
+    fn duration_secs(&self) -> Option<f64> {
         match self.duration_bits.load(Ordering::Relaxed) {
             UNKNOWN_DURATION => None,
             bits => Some(f64::from_bits(bits)),
@@ -102,11 +95,13 @@ impl Track {
         sample_rate: u32,
         channels: usize,
     ) -> (Track, Producer<f32>, Arc<TrackShared>) {
-        let channels = channels.max(1);
         // A whole number of frames, so reads and writes never split a frame.
-        let capacity = sample_rate.max(1) as usize * channels;
+        let capacity = sample_rate.max(1) as usize * channels.max(1);
         let (producer, feed) = RingBuffer::new(capacity);
-        let shared = Arc::new(TrackShared::new());
+        let shared = Arc::new(TrackShared {
+            finished: AtomicBool::new(false),
+            duration_bits: AtomicU64::new(UNKNOWN_DURATION),
+        });
         let track = Track {
             key,
             feed,
@@ -123,19 +118,40 @@ impl Track {
         // has already been pushed, so an empty buffer really is the end.
         self.shared.is_finished() && self.feed.is_empty()
     }
+
+    fn has_ended(&self) -> bool {
+        self.primed && self.is_drained()
+    }
+
+    /// A `Progress` event if one is due now that `frames` more were rendered.
+    fn progress(&mut self, frames: u64, interval: u64, sample_rate: f64) -> Option<MixerEvent> {
+        if !self.primed {
+            return None;
+        }
+        if self.frames_until_progress > frames {
+            self.frames_until_progress -= frames;
+            return None;
+        }
+        self.frames_until_progress = interval;
+        Some(MixerEvent::Progress {
+            key: self.key,
+            position_secs: self.frames_played as f64 / sample_rate,
+            duration_secs: self.shared.duration_secs(),
+        })
+    }
 }
 
 /// Instructions from the control thread.
 pub(crate) enum MixerCommand {
     /// Retire everything and start `track` on the active deck.
     Play(Track),
-    /// Start `track` on the idle deck and crossfade over `fade_frames`.
+    /// Start `track` on the incoming deck and crossfade over `fade_frames`.
     Crossfade { track: Track, fade_frames: u64 },
     /// Make the incoming deck active if it holds `key`.
     Promote { key: TrackKey },
     /// Retire everything.
     Stop,
-    /// The decoder for `key` failed: drop it and report.
+    /// The decoder for `key` failed: drop it (the control thread reports it).
     Fail { key: TrackKey },
 }
 
@@ -150,27 +166,22 @@ pub(crate) enum MixerEvent {
     },
     Ended {
         key: TrackKey,
-        /// Total frames played, for diagnostics and tests.
+        /// Total frames played, for tests.
         frames_played: u64,
-    },
-    Failed {
-        key: TrackKey,
     },
     CrossfadeComplete {
         outgoing: TrackKey,
         incoming: TrackKey,
     },
     /// The track left the mixer because of a command (stop, replace, promote).
-    Unloaded {
-        key: TrackKey,
-    },
+    Unloaded { key: TrackKey },
 }
 
 /// A linear gain ramp evaluated per frame. The gain for frame `n` of the
 /// ramp is exactly `from + (to - from) * n / len`, so two ramps started on
 /// the same frame stay perfectly aligned.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Ramp {
+struct Ramp {
     from: f32,
     to: f32,
     len: u64,
@@ -178,16 +189,11 @@ pub(crate) struct Ramp {
 }
 
 impl Ramp {
-    pub(crate) fn constant(value: f32) -> Self {
-        Self {
-            from: value,
-            to: value,
-            len: 0,
-            pos: 0,
-        }
+    fn constant(value: f32) -> Self {
+        Self::new(value, value, 0)
     }
 
-    pub(crate) fn new(from: f32, to: f32, len: u64) -> Self {
+    fn new(from: f32, to: f32, len: u64) -> Self {
         Self {
             from,
             to,
@@ -197,8 +203,8 @@ impl Ramp {
     }
 
     /// Gain for the next frame (without advancing).
-    pub(crate) fn value(&self) -> f32 {
-        if self.pos >= self.len {
+    fn value(&self) -> f32 {
+        if self.is_done() {
             self.to
         } else {
             let t = self.pos as f64 / self.len as f64;
@@ -220,48 +226,29 @@ impl Ramp {
     fn is_done(&self) -> bool {
         self.pos >= self.len
     }
-
-    fn target(&self) -> f32 {
-        self.to
-    }
 }
 
+/// A track with its gain: on a deck, or fading out as a tail.
 struct Deck {
-    track: Option<Track>,
-    gain: Ramp,
-}
-
-impl Deck {
-    fn empty() -> Self {
-        Self {
-            track: None,
-            gain: Ramp::constant(0.0),
-        }
-    }
-
-    fn key(&self) -> Option<TrackKey> {
-        self.track.as_ref().map(|track| track.key)
-    }
-}
-
-/// A track that was stopped abruptly and is fading out before release.
-struct Tail {
     track: Track,
     gain: Ramp,
 }
 
+/// The deck a crossfade fades into.
+struct Incoming {
+    deck: Deck,
+    fade: Fade,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum CrossfadeState {
-    Idle,
+enum Fade {
     /// Waiting for the incoming track to buffer enough audio.
-    Pending {
-        fade_frames: u64,
-    },
+    Pending { frames: u64 },
     /// Both ramps are running.
-    Ramping {
-        outgoing: TrackKey,
-        incoming: TrackKey,
-    },
+    Ramping,
+    /// The ramps finished; the silent outgoing track plays on until it ends
+    /// or the incoming one is promoted.
+    Done,
 }
 
 /// The control thread's ends of the mixer's queues.
@@ -276,11 +263,11 @@ pub(crate) struct MixerHandles {
 pub(crate) struct Mixer {
     channels: usize,
     sample_rate: u32,
-    decks: [Deck; 2],
-    /// Index of the active deck; the other one is the incoming deck.
-    active: usize,
-    crossfade: CrossfadeState,
-    tails: [Option<Tail>; MAX_TAILS],
+    /// Always occupied while `incoming` is.
+    active: Option<Deck>,
+    incoming: Option<Incoming>,
+    /// Tracks that were stopped abruptly and are fading out before release.
+    tails: [Option<Deck>; MAX_TAILS],
     commands: Consumer<MixerCommand>,
     events: Producer<MixerEvent>,
     garbage: Producer<Track>,
@@ -290,7 +277,7 @@ pub(crate) struct Mixer {
     progress_frames: u64,
 }
 
-fn secs_to_frames(secs: f64, sample_rate: u32) -> u64 {
+pub(crate) fn secs_to_frames(secs: f64, sample_rate: u32) -> u64 {
     let frames = (secs * f64::from(sample_rate)).round();
     if frames.is_finite() && frames > 0.0 {
         frames as u64
@@ -309,9 +296,8 @@ impl Mixer {
         let mixer = Mixer {
             channels,
             sample_rate,
-            decks: [Deck::empty(), Deck::empty()],
-            active: 0,
-            crossfade: CrossfadeState::Idle,
+            active: None,
+            incoming: None,
             tails: std::array::from_fn(|_| None),
             commands: command_rx,
             events: event_tx,
@@ -329,13 +315,10 @@ impl Mixer {
         (mixer, handles)
     }
 
-    #[cfg(test)]
-    fn declick_frames(&self) -> u64 {
-        self.declick_frames
-    }
-
-    fn incoming(&self) -> usize {
-        1 - self.active
+    /// The active deck, then the incoming one.
+    fn decks_mut(&mut self) -> impl Iterator<Item = &mut Deck> {
+        let incoming = self.incoming.as_mut().map(|incoming| &mut incoming.deck);
+        self.active.iter_mut().chain(incoming)
     }
 
     /// Renders one buffer of interleaved output. `out.len()` should be a
@@ -350,23 +333,24 @@ impl Mixer {
         let frames = out.len() / channels;
         let out = &mut out[..frames * channels];
 
-        self.prime_decks();
+        let prime_samples = self.prime_samples;
+        for deck in self.decks_mut() {
+            let track = &mut deck.track;
+            track.primed |= track.feed.slots() >= prime_samples || track.shared.is_finished();
+        }
         self.start_pending_crossfade();
 
-        for deck in &mut self.decks {
-            if let Some(track) = deck.track.as_mut().filter(|track| track.primed) {
-                mix_track(track, &mut deck.gain, out, channels);
-            }
+        for deck in self.decks_mut().filter(|deck| deck.track.primed) {
+            mix_track(deck, out, channels);
         }
         for slot in 0..MAX_TAILS {
-            let finished = match self.tails[slot].as_mut() {
-                Some(tail) => {
-                    mix_track(&mut tail.track, &mut tail.gain, out, channels);
-                    tail.gain.is_done()
-                }
-                None => false,
+            let Some(tail) = &mut self.tails[slot] else {
+                continue;
             };
-            if finished && let Some(tail) = self.tails[slot].take() {
+            mix_track(tail, out, channels);
+            if tail.gain.is_done()
+                && let Some(tail) = self.tails[slot].take()
+            {
                 self.recycle(tail.track);
             }
         }
@@ -387,130 +371,119 @@ impl Mixer {
                 self.start_crossfade(track, fade_frames)
             }
             MixerCommand::Promote { key } => self.promote(key),
-            MixerCommand::Stop => {
-                self.retire_deck(self.active);
-                self.retire_deck(self.incoming());
-                self.crossfade = CrossfadeState::Idle;
-            }
+            MixerCommand::Stop => self.retire_all(),
             MixerCommand::Fail { key } => self.fail(key),
         }
     }
 
     fn play(&mut self, track: Track) {
-        self.retire_deck(self.active);
-        self.retire_deck(self.incoming());
-        self.crossfade = CrossfadeState::Idle;
-        let active = self.active;
-        self.decks[active] = Deck {
-            track: Some(track),
+        self.retire_all();
+        self.active = Some(Deck {
+            track,
             gain: Ramp::new(0.0, 1.0, self.declick_frames),
-        };
+        });
     }
 
     fn start_crossfade(&mut self, track: Track, fade_frames: u64) {
-        if self.decks[self.active].track.is_none() {
+        if self.active.is_none() {
             // Nothing to fade from: just start it.
             self.play(track);
             return;
         }
-        if self.decks[self.incoming()].track.is_some() {
+        if let Some(previous) = self.incoming.take() {
             // A previous crossfade is still going: drop its outgoing track
             // and continue from the previous incoming one.
-            self.retire_deck(self.active);
-            self.active = self.incoming();
+            self.replace_active(previous.deck);
         }
-        let incoming = self.incoming();
-        self.decks[incoming] = Deck {
-            track: Some(track),
-            gain: Ramp::constant(0.0),
-        };
-        self.crossfade = CrossfadeState::Pending { fade_frames };
+        self.incoming = Some(Incoming {
+            deck: Deck {
+                track,
+                gain: Ramp::constant(0.0),
+            },
+            fade: Fade::Pending {
+                frames: fade_frames,
+            },
+        });
     }
 
     fn promote(&mut self, key: TrackKey) {
-        let incoming = self.incoming();
-        if self.decks[incoming].key() != Some(key) {
+        let Some(Incoming { mut deck, .. }) = self
+            .incoming
+            .take_if(|incoming| incoming.deck.track.key == key)
+        else {
             return;
-        }
-        self.retire_deck(self.active);
-        self.active = incoming;
-        let deck = &mut self.decks[incoming];
+        };
         deck.gain = Ramp::new(deck.gain.value(), 1.0, self.declick_frames);
-        self.crossfade = CrossfadeState::Idle;
+        self.replace_active(deck);
     }
 
     fn fail(&mut self, key: TrackKey) {
-        let deck_index = if self.decks[self.active].key() == Some(key) {
-            self.active
-        } else if self.decks[self.incoming()].key() == Some(key) {
-            self.incoming()
-        } else {
-            return;
-        };
-        let deck = std::mem::replace(&mut self.decks[deck_index], Deck::empty());
-        if let Some(track) = deck.track {
-            self.fade_out(track, deck.gain.value());
-        }
-        self.emit(MixerEvent::Failed { key });
-        self.after_deck_lost(deck_index);
-    }
-
-    /// Fixes up deck roles after the track on `deck_index` went away on its
-    /// own (ended or failed).
-    fn after_deck_lost(&mut self, deck_index: usize) {
-        if deck_index == self.active {
-            self.promote_after_active_lost();
-        } else {
-            self.restore_after_incoming_lost();
+        if let Some(deck) = self.active.take_if(|deck| deck.track.key == key) {
+            self.fade_out(deck);
+            self.active_lost();
+        } else if let Some(incoming) = self
+            .incoming
+            .take_if(|incoming| incoming.deck.track.key == key)
+        {
+            self.fade_out(incoming.deck);
+            self.incoming_lost();
         }
     }
 
-    /// The active track is gone. If a crossfade is under way the incoming
-    /// track takes over and carries on with its fade-in undisturbed.
-    fn promote_after_active_lost(&mut self) {
-        let incoming = self.incoming();
-        if self.decks[incoming].track.is_some() {
-            if let CrossfadeState::Pending { fade_frames } = self.crossfade {
+    /// The active track went away on its own (ended or failed). If a
+    /// crossfade is under way the incoming track takes over and carries on
+    /// with its fade-in undisturbed.
+    fn active_lost(&mut self) {
+        if let Some(Incoming { mut deck, fade }) = self.incoming.take() {
+            if let Fade::Pending { frames } = fade {
                 // Its ramp had not started yet; fade in as originally planned.
-                self.decks[incoming].gain =
-                    Ramp::new(0.0, 1.0, fade_frames.max(self.declick_frames));
+                deck.gain = Ramp::new(0.0, 1.0, frames.max(self.declick_frames));
             }
-            self.active = incoming;
+            self.active = Some(deck);
         }
-        self.crossfade = CrossfadeState::Idle;
     }
 
-    /// The incoming track is gone before being promoted. Bring the active
+    /// The incoming track went away before being promoted. Bring the active
     /// track back up so a failed or very short incoming track never leaves
     /// dead air.
-    fn restore_after_incoming_lost(&mut self) {
-        let deck = &mut self.decks[self.active];
-        if deck.track.is_some() && deck.gain.target() < 1.0 {
+    fn incoming_lost(&mut self) {
+        if let Some(deck) = &mut self.active
+            && deck.gain.to < 1.0
+        {
             deck.gain = Ramp::new(deck.gain.value(), 1.0, self.restore_frames);
         }
-        self.crossfade = CrossfadeState::Idle;
     }
 
-    /// Removes the deck's track because of a command, fading it out.
-    fn retire_deck(&mut self, deck_index: usize) {
-        let deck = std::mem::replace(&mut self.decks[deck_index], Deck::empty());
-        if let Some(track) = deck.track {
-            self.emit(MixerEvent::Unloaded { key: track.key });
-            self.fade_out(track, deck.gain.value());
+    /// Makes `deck` the active deck, retiring the one it replaces.
+    fn replace_active(&mut self, deck: Deck) {
+        if let Some(outgoing) = self.active.replace(deck) {
+            self.retire(outgoing);
         }
+    }
+
+    fn retire_all(&mut self) {
+        let incoming = self.incoming.take().map(|incoming| incoming.deck);
+        for deck in [self.active.take(), incoming].into_iter().flatten() {
+            self.retire(deck);
+        }
+    }
+
+    /// Removes a deck's track because of a command, fading it out.
+    fn retire(&mut self, deck: Deck) {
+        self.emit(MixerEvent::Unloaded {
+            key: deck.track.key,
+        });
+        self.fade_out(deck);
     }
 
     /// Moves a track to the tail list for a short de-click fade, or releases
     /// it straight away if it is not audible.
-    fn fade_out(&mut self, track: Track, gain: f32) {
+    fn fade_out(&mut self, Deck { track, gain }: Deck) {
+        let gain = gain.value();
         if !track.primed || gain <= 0.0 {
             self.recycle(track);
             return;
         }
-        let tail = Tail {
-            track,
-            gain: Ramp::new(gain, 0.0, self.declick_frames),
-        };
         let slot = match self.tails.iter().position(Option::is_none) {
             Some(slot) => slot,
             None => {
@@ -521,108 +494,85 @@ impl Mixer {
                 0
             }
         };
-        self.tails[slot] = Some(tail);
-    }
-
-    fn prime_decks(&mut self) {
-        let prime_samples = self.prime_samples;
-        for deck in &mut self.decks {
-            if let Some(track) = deck.track.as_mut()
-                && !track.primed
-                && (track.feed.slots() >= prime_samples || track.shared.is_finished())
-            {
-                track.primed = true;
-            }
-        }
+        self.tails[slot] = Some(Deck {
+            track,
+            gain: Ramp::new(gain, 0.0, self.declick_frames),
+        });
     }
 
     fn start_pending_crossfade(&mut self) {
-        let CrossfadeState::Pending { fade_frames } = self.crossfade else {
+        let (Some(active), Some(incoming)) = (&mut self.active, &mut self.incoming) else {
             return;
         };
-        let incoming = self.incoming();
-        let (Some(incoming_key), Some(outgoing_key)) =
-            (self.decks[incoming].key(), self.decks[self.active].key())
-        else {
+        let Fade::Pending { frames } = incoming.fade else {
             return;
         };
         // Wait until the incoming track has audio. An incoming track that is
         // already over (e.g. an empty file) never starts a fade; it is
         // reported as ended instead.
-        let incoming_ready = self.decks[incoming]
-            .track
-            .as_ref()
-            .is_some_and(|track| track.primed && !track.is_drained());
-        if !incoming_ready {
+        let track = &incoming.deck.track;
+        if !track.primed || track.is_drained() {
             return;
         }
         // A zero-length crossfade still gets the de-click ramp.
-        let len = fade_frames.max(self.declick_frames);
-        let active = &mut self.decks[self.active];
+        let len = frames.max(self.declick_frames);
         active.gain = Ramp::new(active.gain.value(), 0.0, len);
-        self.decks[incoming].gain = Ramp::new(0.0, 1.0, len);
-        self.crossfade = CrossfadeState::Ramping {
-            outgoing: outgoing_key,
-            incoming: incoming_key,
-        };
+        incoming.deck.gain = Ramp::new(0.0, 1.0, len);
+        incoming.fade = Fade::Ramping;
     }
 
     fn check_crossfade_complete(&mut self) {
-        if let CrossfadeState::Ramping { outgoing, incoming } = self.crossfade
-            && self.decks[self.active].gain.is_done()
-            && self.decks[self.incoming()].gain.is_done()
-        {
-            self.crossfade = CrossfadeState::Idle;
-            self.emit(MixerEvent::CrossfadeComplete { outgoing, incoming });
-        }
+        let event = match (&self.active, &mut self.incoming) {
+            (Some(active), Some(incoming))
+                if incoming.fade == Fade::Ramping
+                    && active.gain.is_done()
+                    && incoming.deck.gain.is_done() =>
+            {
+                incoming.fade = Fade::Done;
+                MixerEvent::CrossfadeComplete {
+                    outgoing: active.track.key,
+                    incoming: incoming.deck.track.key,
+                }
+            }
+            _ => return,
+        };
+        self.emit(event);
     }
 
     fn emit_progress(&mut self, frames: u64) {
         let sample_rate = f64::from(self.sample_rate);
         let interval = self.progress_frames;
-        for deck_index in [self.active, self.incoming()] {
-            let Some(track) = self.decks[deck_index].track.as_mut() else {
-                continue;
-            };
-            if !track.primed {
-                continue;
-            }
-            if track.frames_until_progress > frames {
-                track.frames_until_progress -= frames;
-                continue;
-            }
-            track.frames_until_progress = interval;
-            let event = MixerEvent::Progress {
-                key: track.key,
-                position_secs: track.frames_played as f64 / sample_rate,
-                duration_secs: track.shared.duration_secs(),
-            };
+        let mut events = [None; 2];
+        for (event, deck) in events.iter_mut().zip(self.decks_mut()) {
+            *event = deck.track.progress(frames, interval, sample_rate);
+        }
+        for event in events.into_iter().flatten() {
             self.emit(event);
         }
     }
 
+    /// Reports at most one ended deck per buffer: roles may change, and the
+    /// other deck is checked on the next one.
     fn detect_ends(&mut self) {
-        for deck_index in [self.active, self.incoming()] {
-            let ended = self.decks[deck_index]
-                .track
-                .as_ref()
-                .is_some_and(|track| track.primed && track.is_drained());
-            if !ended {
-                continue;
-            }
-            let deck = std::mem::replace(&mut self.decks[deck_index], Deck::empty());
-            if let Some(track) = deck.track {
-                let event = MixerEvent::Ended {
-                    key: track.key,
-                    frames_played: track.frames_played,
-                };
-                self.recycle(track);
-                self.emit(event);
-            }
-            self.after_deck_lost(deck_index);
-            // Roles may have changed; the other deck is checked on the next buffer.
-            break;
+        if let Some(deck) = self.active.take_if(|deck| deck.track.has_ended()) {
+            self.ended(deck.track);
+            self.active_lost();
+        } else if let Some(incoming) = self
+            .incoming
+            .take_if(|incoming| incoming.deck.track.has_ended())
+        {
+            self.ended(incoming.deck.track);
+            self.incoming_lost();
         }
+    }
+
+    fn ended(&mut self, track: Track) {
+        let event = MixerEvent::Ended {
+            key: track.key,
+            frames_played: track.frames_played,
+        };
+        self.recycle(track);
+        self.emit(event);
     }
 
     fn emit(&mut self, event: MixerEvent) {
@@ -632,27 +582,26 @@ impl Mixer {
     }
 
     /// Hands a finished track back to the control thread to be freed there.
+    /// If that queue is full (it should not be) the track is freed here, a
+    /// rare and small cost.
     fn recycle(&mut self, track: Track) {
-        if let Err(rtrb::PushError::Full(track)) = self.garbage.push(track) {
-            // Should not happen; freeing here is a rare, small cost.
-            drop(track);
-        }
+        let _ = self.garbage.push(track);
     }
 }
 
-/// Mixes up to one buffer of `track` into `out` with `gain` applied per
-/// frame. On underrun the missing frames are silent; the ramp still advances
-/// so every deck stays on the same timeline.
-fn mix_track(track: &mut Track, gain: &mut Ramp, out: &mut [f32], channels: usize) {
+/// Mixes up to one buffer of `deck`'s track into `out` with its gain applied
+/// per frame. On underrun the missing frames are silent; the ramp still
+/// advances so every deck stays on the same timeline.
+fn mix_track(deck: &mut Deck, out: &mut [f32], channels: usize) {
+    let Deck { track, gain } = deck;
     let frames = out.len() / channels;
-    let available = track.feed.slots() / channels;
-    let wanted = available.min(frames);
+    let wanted = (track.feed.slots() / channels).min(frames);
     let mut mixed = 0;
     if wanted > 0
         && let Ok(chunk) = track.feed.read_chunk(wanted * channels)
     {
         let (first, second) = chunk.as_slices();
-        let mut samples = first.iter().chain(second.iter());
+        let mut samples = first.iter().chain(second);
         for frame in out.chunks_exact_mut(channels).take(wanted) {
             let g = gain.next_gain();
             for (slot, sample) in frame.iter_mut().zip(&mut samples) {
@@ -785,7 +734,7 @@ mod tests {
     #[test]
     fn play_fades_in_over_declick_then_full_gain() {
         let mut rig = Rig::new(1);
-        let declick = rig.mixer.declick_frames() as usize;
+        let declick = rig.mixer.declick_frames as usize;
         assert_eq!(declick, 5);
         let _feed = rig.play(1, 200, 1.0);
         let out = rig.render(10);
@@ -951,11 +900,7 @@ mod tests {
         let out = rig.render(10);
         assert!(out.iter().all(|s| *s == 1.0));
         // Position counts only frames actually played.
-        let active = rig.mixer.active;
-        let played = rig.mixer.decks[active]
-            .track
-            .as_ref()
-            .map(|t| t.frames_played);
+        let played = rig.mixer.active.as_ref().map(|d| d.track.frames_played);
         assert_eq!(played, Some(120));
     }
 
@@ -1090,10 +1035,7 @@ mod tests {
         assert!(close(out[0], 0.5));
         assert!(close(out[250], 0.75));
         assert!(out[500..].iter().all(|s| close(*s, 1.0)));
-        assert_eq!(
-            rig.non_progress_events(),
-            vec![MixerEvent::Failed { key: 2 }]
-        );
+        assert!(rig.non_progress_events().is_empty());
     }
 
     #[test]
@@ -1113,14 +1055,10 @@ mod tests {
         let out = rig.render(60);
         assert!(close(out[0], 0.5));
         assert!(close(out[59], 1.0));
-        assert_eq!(
-            rig.non_progress_events(),
-            vec![MixerEvent::Failed { key: 1 }]
-        );
+        assert!(rig.non_progress_events().is_empty());
         // Fail for an unknown key is ignored.
         rig.send(MixerCommand::Fail { key: 1 });
-        rig.render(1);
-        assert!(rig.non_progress_events().is_empty());
+        assert!(close(rig.render(1)[0], 1.0));
     }
 
     #[test]
