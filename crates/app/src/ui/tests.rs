@@ -809,6 +809,45 @@ async fn settings_button_opens_settings(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+/// Settings' About page shows the version and, in a dev build, a disabled
+/// "Check for Updates" (dev builds never update themselves).
+#[gpui_kit::test]
+async fn about_page_shows_version_and_dev_builds_dont_update(cx: &mut TestAppContext) {
+    use crate::updates::{UpdateStatus, VERSION_LABEL};
+    let dir = tempfile::tempdir().unwrap();
+    let (window, view) = open_app(cx, dir.path());
+    assert!(VERSION_LABEL.contains("-dev ("), "{VERSION_LABEL}");
+    let status = view.read_with(cx, |view, cx| view.updates.read(cx).status().clone());
+    assert_eq!(status, UpdateStatus::DevBuild);
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("open-settings", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    // gpui-kit names the sidebar's pages "0-<index>"; About is the fifth.
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("0-4", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("check-for-updates").is_some(),
+            "About page not shown"
+        );
+        // Disabled in a dev build: clicking does nothing.
+        window.click("check-for-updates", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let status = view.read_with(cx, |view, cx| view.updates.read(cx).status().clone());
+    assert_eq!(status, UpdateStatus::DevBuild);
+}
+
 /// Only Upcoming items can be selected: clicking the Active Item does
 /// nothing, and the up arrow stops at the first Upcoming item.
 #[gpui_kit::test]

@@ -9,6 +9,7 @@ mod persist;
 mod search;
 mod station;
 mod ui;
+mod updates;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,6 +32,12 @@ fn main() {
     if let Some(code) = elizabeats_botguard::helper_main_if_requested() {
         std::process::exit(code);
     }
+
+    // Velopack's install/update hooks: the installer and updater launch the
+    // app with special arguments, and a downloaded update that wasn't
+    // installed yet gets installed here. After the helper check on purpose,
+    // so the helper process never does this.
+    velopack::VelopackApp::build().run();
 
     // ELIZABEATS_DATA_DIR points the app at another data folder (testing).
     let launch = Launch {

@@ -1,0 +1,83 @@
+# Releases with knope (https://knope.tech). Each user-visible change adds a
+# Markdown file to .changeset/ (run `knope document-change`, or write one):
+#
+#   ---
+#   default: minor
+#   ---
+#
+#   # Short summary of the change
+#
+#   Optional details, in Markdown.
+#
+# `default` is the size of the change: patch (fixes), minor (features) or
+# major. Changes users don't notice (refactors, CI, docs) don't need a file.
+# Only change files may live in .changeset/: knope reads every file there.
+#
+# .github/workflows/release.yml runs on every push to main:
+# - prepare-release, while the current version is already released: collects
+#   the change files into a "Release Elizabeats" pull request that bumps the
+#   version and adds a CHANGELOG.md section.
+# - release, once the version isn't released yet (that pull request was
+#   merged): creates the v<version> tag and GitHub release with the downloads.
+
+[package]
+# The version lives in [workspace.package] in the root Cargo.toml; every
+# workspace crate inherits it and is listed in Cargo.lock with it.
+versioned_files = [
+  "Cargo.toml",
+  { path = "Cargo.lock", dependency = "elizabeats" },
+  { path = "Cargo.lock", dependency = "elizabeats-audio" },
+  { path = "Cargo.lock", dependency = "elizabeats-botguard" },
+  { path = "Cargo.lock", dependency = "elizabeats-core" },
+  { path = "Cargo.lock", dependency = "elizabeats-library" },
+  { path = "Cargo.lock", dependency = "elizabeats-store" },
+  { path = "Cargo.lock", dependency = "elizabeats-youtube" },
+]
+changelog = "CHANGELOG.md"
+# Everything scripts/package.sh puts in target/dist on each OS; the release
+# workflow downloads them here.
+assets = "artifacts/*"
+
+[[workflows]]
+name = "prepare-release"
+
+[[workflows.steps]]
+type = "Command"
+command = "git switch -c release"
+
+[[workflows.steps]]
+type = "PrepareRelease"
+
+[[workflows.steps]]
+type = "Command"
+command = "git commit -m \"chore: prepare release $version\""
+
+[[workflows.steps]]
+type = "Command"
+command = "git push --force --set-upstream origin release"
+
+[[workflows.steps]]
+type = "CreatePullRequest"
+base = "main"
+
+[workflows.steps.title]
+template = "Release Elizabeats $version"
+
+[workflows.steps.body]
+template = "Merging this releases Elizabeats $version: checks run, every platform is built and packaged, and the GitHub release is published.\n\n$changelog"
+
+[[workflows]]
+name = "release"
+
+[[workflows.steps]]
+type = "Release"
+
+[[workflows]]
+name = "document-change"
+
+[[workflows.steps]]
+type = "CreateChangeFile"
+
+[github]
+owner = "n1ckoates"
+repo = "elizabeats"

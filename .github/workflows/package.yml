@@ -1,0 +1,128 @@
+name: Package
+
+# Builds and packages the app on each OS with Velopack (scripts/package.sh).
+#
+# - CI (release: false): test builds, versioned like 1.0.0-dev.42, that don't
+#   update themselves. The downloads are attached to the run.
+# - Release (release: true): the real version, with delta updates from the
+#   previous release; the files go to the release workflow to publish.
+on:
+  workflow_call:
+    inputs:
+      release:
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep in step with the velopack crate version in crates/app/Cargo.toml.
+  VPK_VERSION: 1.2.161
+
+jobs:
+  package:
+    name: Package (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      # `installer` and `portable`: each platform's downloads in target/dist,
+      # attached to test builds one file at a time. Linux's AppImage is both.
+      matrix:
+        include:
+          - name: macOS Apple Silicon
+            slug: macos-arm64
+            os: macos-latest
+            installer: target/dist/*-Setup.pkg
+            portable: target/dist/*-Portable.zip
+          # Cross-built on the Apple Silicon runner.
+          - name: macOS Intel
+            slug: macos-x64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            installer: target/dist/*-Setup.pkg
+            portable: target/dist/*-Portable.zip
+          - name: Windows
+            slug: windows
+            os: windows-latest
+            installer: target/dist/*-Setup.exe
+            portable: target/dist/*-Portable.zip
+          # The oldest supported Ubuntu, so the AppImage runs on it and newer.
+          - name: Linux
+            slug: linux
+            os: ubuntu-22.04
+            installer: target/dist/*.AppImage
+    runs-on: ${{ matrix.os }}
+    env:
+      # Set only for a cross build (the steps add `--target` when it is).
+      TARGET: ${{ matrix.target }}
+      # Release builds show the plain version and update themselves.
+      ELIZABEATS_RELEASE: ${{ inputs.release && '1' || '' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+        with:
+          cache-key: ${{ matrix.name }}
+      # Velopack's packaging tool (vpk) runs on .NET.
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 8.0.x
+      - name: Install vpk
+        run: dotnet tool install -g vpk --version ${{ env.VPK_VERSION }}
+
+      - name: Add the build target
+        if: matrix.target
+        run: rustup target add ${{ matrix.target }}
+      - name: Version
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "elizabeats") | .version')
+          if [[ "$ELIZABEATS_RELEASE" != 1 ]]; then
+            version="$version-dev.${{ github.run_number }}"
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Build
+        shell: bash
+        run: cargo build --release -p elizabeats ${TARGET:+--target "$TARGET"}
+      # The Liquid Glass app icon for macOS 26+ (packaging copies it in).
+      - name: Compile the macOS icon
+        if: runner.os == 'macOS'
+        run: scripts/compile-macos-icon.sh
+      - name: Package
+        shell: bash
+        env:
+          VELOPACK_DELTAS: ${{ inputs.release && '1' || '' }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: scripts/package.sh "$VERSION" ${TARGET:+"$TARGET"}
+
+      # Test builds: each download on its own (not zipped).
+      - uses: actions/upload-artifact@v7
+        if: ${{ !inputs.release }}
+        with:
+          path: ${{ matrix.installer }}
+          archive: false
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        if: ${{ !inputs.release && matrix.portable }}
+        with:
+          path: ${{ matrix.portable }}
+          archive: false
+          if-no-files-found: error
+      # Releases: everything the release publishes, for the release workflow.
+      - uses: actions/upload-artifact@v7
+        if: ${{ inputs.release }}
+        with:
+          name: release-${{ matrix.slug }}
+          path: target/dist/*
+          if-no-files-found: error
+
+      # The Microsoft Store package (unsigned: the Store signs it), submitted
+      # by hand in Partner Center.
+      - name: Package the Microsoft Store MSIX
+        if: runner.os == 'Windows'
+        shell: bash
+        run: scripts/package-msix.sh
+      - uses: actions/upload-artifact@v7
+        if: runner.os == 'Windows'
+        with:
+          path: target/packages/*.msix
+          archive: false
+          if-no-files-found: error
