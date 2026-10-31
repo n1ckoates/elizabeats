@@ -812,7 +812,7 @@ async fn about_page_shows_version_and_dev_builds_dont_update(cx: &mut TestAppCon
     let (window, view) = open_app(cx, dir.path());
     assert!(VERSION_LABEL.contains("-dev ("), "{VERSION_LABEL}");
     let status = view.read_with(cx, |view, cx| view.updates.read(cx).status().clone());
-    assert_eq!(status, UpdateStatus::DevBuild);
+    assert!(matches!(status, UpdateStatus::DevBuild));
 
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
@@ -839,7 +839,7 @@ async fn about_page_shows_version_and_dev_builds_dont_update(cx: &mut TestAppCon
     .unwrap();
     cx.run_until_parked();
     let status = view.read_with(cx, |view, cx| view.updates.read(cx).status().clone());
-    assert_eq!(status, UpdateStatus::DevBuild);
+    assert!(matches!(status, UpdateStatus::DevBuild));
 }
 
 /// Only Upcoming items can be selected: clicking the Active Item does

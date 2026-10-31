@@ -14,10 +14,12 @@ mod settings;
 use std::sync::Arc;
 
 use elizabeats_core::Track;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, StyledExt, h_flex, v_flex};
 use gpui_kit::{
-    App, Div, FontFeatures, Image, KeyBinding, ObjectFit, ParentElement, SharedString, Styled,
-    StyledImage, div, img, px,
+    AnyElement, App, Div, FontFeatures, Image, InteractiveElement, IntoElement, KeyBinding,
+    ObjectFit, ParentElement, SharedString, StatefulInteractiveElement, Styled, StyledImage, div,
+    img, px,
 };
 
 pub use app_view::AppView;
@@ -197,6 +199,19 @@ pub fn file_manager_name() -> &'static str {
     } else {
         "file manager"
     }
+}
+
+/// `child` with a hover tooltip; `id` must be unique in the window.
+pub fn with_tooltip(
+    id: impl Into<SharedString>,
+    text: &'static str,
+    child: impl IntoElement,
+) -> AnyElement {
+    div()
+        .id(id.into())
+        .tooltip(move |window, cx| Tooltip::new(text).build(window, cx))
+        .child(child)
+        .into_any_element()
 }
 
 pub fn alert_icon(cx: &App) -> Icon {

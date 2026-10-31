@@ -104,23 +104,17 @@ pub struct Launch {
 
 /// Creates the data directory and all long-lived services.
 pub fn bootstrap(launch: Launch) -> Result<StationParts, String> {
-    let (data_dir, settings) = match launch.data_dir {
-        Some(dir) => {
-            std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-            let settings = elizabeats_store::load_settings(&dir);
-            (dir, settings)
-        }
-        None => {
-            let dir: PathBuf = elizabeats_store::data_dir().map_err(|error| error.to_string())?;
-            let settings = elizabeats_store::load_settings(&dir);
-            (dir, settings)
-        }
-    };
+    let data_dir = match launch.data_dir {
+        Some(dir) => std::fs::create_dir_all(&dir).map(|()| dir),
+        None => elizabeats_store::data_dir().map_err(std::io::Error::other),
+    }
+    .map_err(|error| error.to_string())?;
+    let settings = elizabeats_store::load_settings(&data_dir);
     elizabeats_store::remove_stale_temp_files(&data_dir);
 
     let diagnostics = elizabeats_store::DiagnosticsStore::new(&data_dir);
     let sink = diagnostics.sink();
-    let (events, receiver) = station::event_channel();
+    let (events, receiver) = futures::channel::mpsc::unbounded();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -171,22 +165,18 @@ pub fn bootstrap(launch: Launch) -> Result<StationParts, String> {
     let youtube = {
         // YoutubeMusic starts its workers on the I/O runtime.
         let _guard = runtime.enter();
-        Arc::new(
-            YoutubeMusic::new(YoutubeConfig {
-                data_dir: data_dir.clone(),
-                botguard,
-                diagnostics: sink,
-                on_cache_change: Arc::new(move || {
-                    let _ = cache_events.unbounded_send(StationEvent::CacheChanged);
-                }),
-            })
-            .map_err(|error| error.to_string())?,
-        )
-    };
-    {
-        let _guard = runtime.enter();
+        let youtube = YoutubeMusic::new(YoutubeConfig {
+            data_dir: data_dir.clone(),
+            botguard,
+            diagnostics: sink,
+            on_cache_change: Arc::new(move || {
+                let _ = cache_events.unbounded_send(StationEvent::CacheChanged);
+            }),
+        })
+        .map_err(|error| error.to_string())?;
         youtube.prewarm();
-    }
+        Arc::new(youtube)
+    };
 
     let persist_events = events.clone();
     let persistence = Persistence::start(data_dir.clone(), move |message| {

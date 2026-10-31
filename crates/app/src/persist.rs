@@ -4,20 +4,22 @@
 //! a later recovery snapshot can never be overwritten by an earlier one.
 //! Failures are reported back to the UI instead of being dropped.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 use elizabeats_core::{AppSettings, PlayLogEntry, RecoverySnapshot};
+use elizabeats_store::StoreError;
+use futures::channel::oneshot;
 
-type Reply = futures::channel::oneshot::Sender<Result<(), String>>;
+type Reply = oneshot::Sender<Result<(), String>>;
 
 enum Job {
     SaveRecovery(RecoverySnapshot),
     DiscardRecovery,
     SavePlayLog(PlayLogEntry),
-    ClearPlayLog(Option<Reply>),
+    ClearPlayLog(Reply),
     SaveSettings(AppSettings, Reply),
     Flush(mpsc::Sender<()>),
 }
@@ -46,6 +48,13 @@ impl Persistence {
         }
     }
 
+    /// Sends a job that answers with its result.
+    fn request(&self, job: impl FnOnce(Reply) -> Job) -> oneshot::Receiver<Result<(), String>> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(job(reply));
+        receiver
+    }
+
     pub fn save_recovery(&self, snapshot: RecoverySnapshot) {
         self.send(Job::SaveRecovery(snapshot));
     }
@@ -58,19 +67,12 @@ impl Persistence {
         self.send(Job::SavePlayLog(entry));
     }
 
-    pub fn clear_play_log(&self) -> futures::channel::oneshot::Receiver<Result<(), String>> {
-        let (reply, receiver) = futures::channel::oneshot::channel();
-        self.send(Job::ClearPlayLog(Some(reply)));
-        receiver
+    pub fn clear_play_log(&self) -> oneshot::Receiver<Result<(), String>> {
+        self.request(Job::ClearPlayLog)
     }
 
-    pub fn save_settings(
-        &self,
-        settings: AppSettings,
-    ) -> futures::channel::oneshot::Receiver<Result<(), String>> {
-        let (reply, receiver) = futures::channel::oneshot::channel();
-        self.send(Job::SaveSettings(settings, reply));
-        receiver
+    pub fn save_settings(&self, settings: AppSettings) -> oneshot::Receiver<Result<(), String>> {
+        self.request(|reply| Job::SaveSettings(settings, reply))
     }
 
     /// Blocks until every earlier write has finished (or `timeout` passes).
@@ -81,65 +83,49 @@ impl Persistence {
     }
 }
 
-fn run(dir: &std::path::Path, jobs: &mpsc::Receiver<Job>, on_error: &dyn Fn(String)) {
-    while let Ok(job) = jobs.recv() {
+fn run(dir: &Path, jobs: &mpsc::Receiver<Job>, on_error: &dyn Fn(String)) {
+    let report = |what: &str, result: Result<(), StoreError>| {
+        if let Err(error) = result {
+            on_error(format!("{what}: {error}"));
+        }
+    };
+    let reply = |reply: Reply, result: Result<(), StoreError>| {
+        let _ = reply.send(result.map_err(|error| error.to_string()));
+    };
+    let mut next = None;
+    while let Some(job) = next.take().or_else(|| jobs.recv().ok()) {
         match job {
             Job::SaveRecovery(mut snapshot) => {
                 // Only the newest queued snapshot matters; skip superseded ones.
-                let mut deferred = Vec::new();
-                while let Ok(next) = jobs.try_recv() {
-                    match next {
+                while let Ok(job) = jobs.try_recv() {
+                    match job {
                         Job::SaveRecovery(newer) => snapshot = newer,
                         other => {
-                            deferred.push(other);
+                            next = Some(other);
                             break;
                         }
                     }
                 }
-                if let Err(error) = elizabeats_store::save_recovery(dir, &snapshot) {
-                    on_error(format!("Queue recovery could not be saved: {error}"));
-                }
-                for job in deferred {
-                    handle_other(dir, job, on_error);
-                }
+                report(
+                    "Queue recovery could not be saved",
+                    elizabeats_store::save_recovery(dir, &snapshot),
+                );
             }
-            other => handle_other(dir, other, on_error),
-        }
-    }
-}
-
-fn handle_other(dir: &std::path::Path, job: Job, on_error: &dyn Fn(String)) {
-    match job {
-        Job::SaveRecovery(snapshot) => {
-            if let Err(error) = elizabeats_store::save_recovery(dir, &snapshot) {
-                on_error(format!("Queue recovery could not be saved: {error}"));
+            Job::DiscardRecovery => report(
+                "Queue recovery could not be discarded",
+                elizabeats_store::discard_recovery(dir),
+            ),
+            Job::SavePlayLog(entry) => report(
+                "Play log could not be saved",
+                elizabeats_store::append_play_log(dir, &entry),
+            ),
+            Job::ClearPlayLog(answer) => reply(answer, elizabeats_store::clear_play_log(dir)),
+            Job::SaveSettings(settings, answer) => {
+                reply(answer, elizabeats_store::save_settings(dir, &settings));
             }
-        }
-        Job::DiscardRecovery => {
-            if let Err(error) = elizabeats_store::discard_recovery(dir) {
-                on_error(format!("Queue recovery could not be discarded: {error}"));
+            Job::Flush(done) => {
+                let _ = done.send(());
             }
-        }
-        Job::SavePlayLog(entry) => {
-            if let Err(error) = elizabeats_store::append_play_log(dir, &entry) {
-                on_error(format!("Play log could not be saved: {error}"));
-            }
-        }
-        Job::ClearPlayLog(reply) => {
-            let result = elizabeats_store::clear_play_log(dir).map_err(|error| error.to_string());
-            if let Some(reply) = reply {
-                let _ = reply.send(result);
-            } else if let Err(error) = result {
-                on_error(format!("Play log could not be cleared: {error}"));
-            }
-        }
-        Job::SaveSettings(settings, reply) => {
-            let result =
-                elizabeats_store::save_settings(dir, &settings).map_err(|error| error.to_string());
-            let _ = reply.send(result);
-        }
-        Job::Flush(done) => {
-            let _ = done.send(());
         }
     }
 }

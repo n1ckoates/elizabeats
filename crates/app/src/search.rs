@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use elizabeats_core::{SourceId, Track};
-use elizabeats_library::LocalLibrary;
 use elizabeats_youtube::YoutubeMusic;
 use gpui_kit::{Context, Entity, Task};
 
@@ -22,7 +21,6 @@ pub enum SearchStatus {
 pub struct Search {
     station: Entity<Station>,
     query: String,
-    status: SearchStatus,
     tracks: Vec<Track>,
     errors: Vec<String>,
     /// Sources still running for the current request.
@@ -59,7 +57,6 @@ impl Search {
         let mut search = Self {
             station,
             query: String::new(),
-            status: SearchStatus::Searching,
             tracks: Vec::new(),
             errors: Vec::new(),
             remaining: 0,
@@ -76,7 +73,11 @@ impl Search {
     }
 
     pub fn status(&self) -> SearchStatus {
-        self.status
+        if self.remaining > 0 {
+            SearchStatus::Searching
+        } else {
+            SearchStatus::Complete
+        }
     }
 
     pub fn tracks(&self) -> &[Track] {
@@ -106,12 +107,11 @@ impl Search {
         let query = self.query.trim().to_owned();
         self.tracks.clear();
         self.errors.clear();
-        self.status = SearchStatus::Searching;
         self.remaining = if query.is_empty() { 1 } else { 2 };
         self._youtube_task = None;
 
         let services = self.station.read(cx).services().clone();
-        let local = local_search(&services.library, &query);
+        let local = services.library.search(&query);
         self.apply(generation, local, "Local library");
 
         if !query.is_empty() {
@@ -139,14 +139,7 @@ impl Search {
             Ok(tracks) => merge_tracks(&mut self.tracks, tracks),
             Err(error) => self.errors.push(format!("{source}: {error}")),
         }
-        if self.remaining == 0 {
-            self.status = SearchStatus::Complete;
-        }
     }
-}
-
-fn local_search(library: &LocalLibrary, query: &str) -> Result<Vec<Track>, String> {
-    library.search(query)
 }
 
 /// Runs on the tokio runtime; the task is aborted if a newer search replaces it.

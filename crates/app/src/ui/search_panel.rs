@@ -28,7 +28,9 @@ use gpui_kit::base::TestSupportExt;
 use super::drag::{DragPayload, DragPreview};
 use super::menus::{MenuAction, build_menu};
 use super::queue_panel::track_link_action;
-use super::{AppView, PANEL_HEADER_HEIGHT, RowSize, row, tabular, track_artwork, track_details};
+use super::{
+    AppView, PANEL_HEADER_HEIGHT, RowSize, row, tabular, track_artwork, track_details, with_tooltip,
+};
 use crate::search::SearchStatus;
 
 const RESULT_GROUP: &str = "search-row";
@@ -180,26 +182,20 @@ impl AppView {
 
         let mut badges: Vec<AnyElement> = Vec::new();
         if track.explicit {
-            badges.push(
-                div()
-                    .id(SharedString::from(format!("explicit-{key}")))
-                    .tooltip(|window, cx| Tooltip::new("Explicit").build(window, cx))
-                    .child(Tag::secondary().small().child("E"))
-                    .into_any_element(),
-            );
+            badges.push(with_tooltip(
+                format!("explicit-{key}"),
+                "Explicit",
+                Tag::secondary().small().child("E"),
+            ));
         }
         if is_cached {
-            badges.push(
-                div()
-                    .id(SharedString::from(format!("cached-{key}")))
-                    .tooltip(|window, cx| Tooltip::new("Downloaded").build(window, cx))
-                    .child(
-                        Icon::new(Lucide::Download)
-                            .xsmall()
-                            .text_color(cx.theme().muted_foreground),
-                    )
-                    .into_any_element(),
-            );
+            badges.push(with_tooltip(
+                format!("cached-{key}"),
+                "Downloaded",
+                Icon::new(Lucide::Download)
+                    .xsmall()
+                    .text_color(cx.theme().muted_foreground),
+            ));
         }
 
         let add_station = self.station.clone();

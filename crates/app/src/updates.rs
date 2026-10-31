@@ -22,7 +22,7 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// The version this build shows, e.g. `1.0.0` or `1.0.0-dev (a1b2c3d)`.
 pub const VERSION_LABEL: &str = env!("ELIZABEATS_VERSION_LABEL");
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum UpdateStatus {
     /// Updates are off in builds other than releases.
     DevBuild,
@@ -35,16 +35,13 @@ pub enum UpdateStatus {
         version: String,
     },
     /// Downloaded; installs when the app quits.
-    Ready {
-        version: String,
-    },
+    Ready(Box<UpdateInfo>),
     Failed(String),
 }
 
 pub struct Updates {
     manager: Option<UpdateManager>,
     status: UpdateStatus,
-    ready: Option<UpdateInfo>,
     /// Restart into the new version once the update is installed on quit.
     restart_after_quit: bool,
     task: Option<Task<()>>,
@@ -83,7 +80,6 @@ impl Updates {
         Self {
             manager,
             status,
-            ready: None,
             restart_after_quit: false,
             task: None,
             _periodic: periodic,
@@ -146,8 +142,7 @@ impl Updates {
             let _ = this.update(cx, |this, cx| match downloaded {
                 Ok(()) => {
                     tracing::info!("update {version} downloaded");
-                    this.ready = Some(update);
-                    this.finish(UpdateStatus::Ready { version }, cx);
+                    this.finish(UpdateStatus::Ready(Box::new(update)), cx);
                 }
                 Err(error) => this.fail(&error, cx),
             });
@@ -172,12 +167,12 @@ impl Updates {
     /// Hands a downloaded update to Velopack's updater, which installs it
     /// once this process has exited (and restarts the app if asked to).
     fn install_on_quit(&mut self) {
-        let (Some(manager), Some(update)) = (&self.manager, self.ready.take()) else {
+        let (Some(manager), UpdateStatus::Ready(update)) = (&self.manager, &self.status) else {
             return;
         };
         let restart = self.restart_after_quit;
         if let Err(error) =
-            manager.wait_exit_then_apply_updates(&update, true, restart, Vec::<String>::new())
+            manager.wait_exit_then_apply_updates(&**update, true, restart, Vec::<String>::new())
         {
             tracing::warn!("could not start installing the update: {error}");
         }

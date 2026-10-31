@@ -19,7 +19,7 @@ use elizabeats_core::{
 use elizabeats_library::LocalLibrary;
 use elizabeats_youtube::YoutubeMusic;
 use futures::StreamExt;
-use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use gpui_kit::{Context, Task};
 
 use crate::persist::Persistence;
@@ -80,13 +80,6 @@ pub struct StationParts {
         UnboundedSender<StationEvent>,
         UnboundedReceiver<StationEvent>,
     ),
-}
-
-pub fn event_channel() -> (
-    UnboundedSender<StationEvent>,
-    UnboundedReceiver<StationEvent>,
-) {
-    unbounded()
 }
 
 impl Station {
