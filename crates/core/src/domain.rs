@@ -75,25 +75,71 @@ impl fmt::Display for TrackKey {
     }
 }
 
-/// A Queue item as persisted in recovery snapshots and the Play Log.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ItemKind {
+    Track(Track),
+    Break,
+}
+
+/// A Queue item: a Track or a Break, with an id unique within the Queue.
+/// Serialized as `{"type":"track","id":…,"track":{…}}` / `{"type":"break","id":…}`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(into = "StoredItem", from = "StoredItem")]
+pub struct QueueItem {
+    pub id: String,
+    pub kind: ItemKind,
+}
+
+impl QueueItem {
+    pub fn track(id: impl Into<String>, track: Track) -> Self {
+        Self {
+            id: id.into(),
+            kind: ItemKind::Track(track),
+        }
+    }
+
+    pub fn new_break(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            kind: ItemKind::Break,
+        }
+    }
+
+    pub fn as_track(&self) -> Option<&Track> {
+        match &self.kind {
+            ItemKind::Track(track) => Some(track),
+            ItemKind::Break => None,
+        }
+    }
+
+    /// The Track's title, or "Break".
+    pub fn title(&self) -> &str {
+        self.as_track().map_or("Break", |track| &track.title)
+    }
+}
+
+/// The on-disk shape of a [`QueueItem`].
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
-pub enum StoredQueueItem {
+enum StoredItem {
     Track { id: String, track: Track },
     Break { id: String },
 }
 
-impl StoredQueueItem {
-    pub fn id(&self) -> &str {
-        match self {
-            Self::Track { id, .. } | Self::Break { id } => id,
+impl From<QueueItem> for StoredItem {
+    fn from(item: QueueItem) -> Self {
+        match item.kind {
+            ItemKind::Track(track) => Self::Track { id: item.id, track },
+            ItemKind::Break => Self::Break { id: item.id },
         }
     }
+}
 
-    pub fn track(&self) -> Option<&Track> {
-        match self {
-            Self::Track { track, .. } => Some(track),
-            Self::Break { .. } => None,
+impl From<StoredItem> for QueueItem {
+    fn from(item: StoredItem) -> Self {
+        match item {
+            StoredItem::Track { id, track } => Self::track(id, track),
+            StoredItem::Break { id } => Self::new_break(id),
         }
     }
 }
@@ -118,7 +164,7 @@ pub enum PlayLogReason {
 #[serde(rename_all = "camelCase")]
 pub struct PlayLogEntry {
     pub id: String,
-    pub item: StoredQueueItem,
+    pub item: QueueItem,
     /// RFC 3339 timestamp in UTC.
     pub started_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -139,7 +185,7 @@ pub enum RecoveryStatus {
 pub struct RecoverySnapshot {
     pub version: u32,
     pub status: RecoveryStatus,
-    pub queue: Vec<StoredQueueItem>,
+    pub queue: Vec<QueueItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_started_at: Option<String>,
     pub updated_at: String,
@@ -266,9 +312,28 @@ mod tests {
 
     #[test]
     fn stored_queue_item_uses_type_tag() {
-        let item = StoredQueueItem::Break { id: "b1".into() };
+        let item = QueueItem::new_break("b1");
         let json = serde_json::to_string(&item).unwrap_or_default();
         assert_eq!(json, r#"{"type":"break","id":"b1"}"#);
+        let track = QueueItem::track(
+            "t1",
+            Track {
+                id: "abc".into(),
+                source: SourceId::Local,
+                title: "t".into(),
+                artist: "a".into(),
+                album: None,
+                duration_seconds: None,
+                artwork_url: None,
+                explicit: false,
+            },
+        );
+        let json = serde_json::to_string(&track).unwrap_or_default();
+        assert_eq!(
+            json,
+            r#"{"type":"track","id":"t1","track":{"id":"abc","source":"local","title":"t","artist":"a"}}"#
+        );
+        assert_eq!(serde_json::from_str::<QueueItem>(&json).ok(), Some(track));
     }
 
     #[test]
