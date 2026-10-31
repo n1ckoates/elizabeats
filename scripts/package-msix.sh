@@ -15,7 +15,7 @@ if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   exit 1
 fi
 
-makeappx=$(ls "/c/Program Files (x86)/Windows Kits/10/bin/"*/x64/makeappx.exe | sort -V | tail -1)
+sdk_bin=$(dirname "$(ls "/c/Program Files (x86)/Windows Kits/10/bin/"*/x64/makeappx.exe | sort -V | tail -1)")
 
 stage=target/msix
 rm -rf "$stage"
@@ -26,4 +26,13 @@ sed "s/Version=\"0.0.0.0\"/Version=\"$version.0\"/" \
   crates/app/windows/Package.appxmanifest > "$stage/AppxManifest.xml"
 grep -q "Version=\"$version.0\"" "$stage/AppxManifest.xml"
 
-"$makeappx" pack -o -d "$stage" -p "target/packages/Elizabeats_${version}_x64.msix"
+# The resource index lets Windows pick the right icon variant (sizes, and the
+# unplated ones without a colored tile behind them). Without it, Windows only
+# sees the plain Square44x44Logo.png and draws it on an accent-color plate.
+# (MSYS_NO_PATHCONV: Git Bash would otherwise turn options like /cf into paths.)
+MSYS_NO_PATHCONV=1 "$sdk_bin/makepri.exe" createconfig \
+  /cf target/msix-priconfig.xml /dq en-US /pv 10.0.0 /o
+MSYS_NO_PATHCONV=1 "$sdk_bin/makepri.exe" new /pr "$stage" /cf target/msix-priconfig.xml \
+  /mn "$stage/AppxManifest.xml" /of "$stage/resources.pri" /o
+
+"$sdk_bin/makeappx.exe" pack -o -d "$stage" -p "target/packages/Elizabeats_${version}_x64.msix"
