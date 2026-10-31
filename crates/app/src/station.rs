@@ -13,7 +13,8 @@ use std::time::Duration;
 use elizabeats_audio::AudioEngine;
 use elizabeats_core::session::{AudioCommand, AudioEvent, Effect, RequestId, Session};
 use elizabeats_core::{
-    AppSettings, DiagnosticEvent, DiagnosticSink, DownloadCacheStatus, SourceId, Track, TrackKey,
+    AppSettings, DiagnosticEvent, DiagnosticSink, DownloadCacheStatus, QueueItem, SourceId, Track,
+    TrackKey,
 };
 use elizabeats_library::LocalLibrary;
 use elizabeats_youtube::YoutubeMusic;
@@ -112,23 +113,16 @@ impl Station {
 
         // Startup reads are small local files; doing them now means the first
         // frame already knows whether to offer recovery.
-        let recovery =
-            elizabeats_store::read_recovery(&services.data_dir).map_err(|error| error.to_string());
-        let protected: Vec<String> = match &recovery {
-            Ok(Some(snapshot))
-                if snapshot.status == elizabeats_core::RecoveryStatus::Interrupted =>
-            {
-                snapshot
-                    .queue
-                    .iter()
-                    .filter_map(|item| item.track())
-                    .filter(|track| track.source == SourceId::YoutubeMusic)
-                    .map(|track| track.id.clone())
-                    .collect()
-            }
-            _ => Vec::new(),
-        };
-        session.recovery_loaded(recovery.map_err(|error| strip_prefix(&error)));
+        session.recovery_loaded(
+            elizabeats_store::read_recovery(&services.data_dir)
+                .map_err(|error| strip_prefix(&error.to_string())),
+        );
+        let protected = youtube_ids(
+            session
+                .pending_recovery()
+                .into_iter()
+                .flat_map(|snapshot| snapshot.queue.iter().filter_map(QueueItem::as_track)),
+        );
         session.play_log_loaded(
             elizabeats_store::read_play_log(&services.data_dir).map_err(|error| error.to_string()),
         );
@@ -201,16 +195,12 @@ impl Station {
     // ---- Session commands --------------------------------------------------
 
     /// Runs a Session command and executes its effects.
-    pub fn command(
-        &mut self,
-        cx: &mut Context<Self>,
-        run: impl FnOnce(&mut Session) -> Vec<Effect>,
-    ) {
+    pub fn command(&mut self, cx: &mut Context<Self>, run: impl FnOnce(&mut Session)) {
         if self.shutting_down {
             return;
         }
-        let effects = run(&mut self.session);
-        self.execute(effects);
+        run(&mut self.session);
+        self.execute();
         cx.notify();
     }
 
@@ -264,13 +254,7 @@ impl Station {
         &mut self,
         cx: &mut Context<Self>,
     ) -> futures::channel::oneshot::Receiver<Result<(), String>> {
-        let effects = self.session.clear_play_log();
-        // ClearPlayLog is the only effect; route it through the awaited path.
-        debug_assert!(
-            effects
-                .iter()
-                .all(|effect| matches!(effect, Effect::ClearPlayLog))
-        );
+        self.session.clear_play_log();
         cx.notify();
         self.services.persistence.clear_play_log()
     }
@@ -278,7 +262,7 @@ impl Station {
     // ---- Shutdown ----------------------------------------------------------
 
     pub fn needs_close_confirmation(&self) -> bool {
-        !self.shutting_down && self.session.needs_close_confirmation()
+        !self.shutting_down && !self.session.queue().is_stopped()
     }
 
     /// Stops playback, saves a clean snapshot, and flushes every writer.
@@ -288,8 +272,8 @@ impl Station {
             return true;
         }
         self.shutting_down = true;
-        let effects = self.session.shutdown();
-        self.execute(effects);
+        self.session.shutdown();
+        self.execute();
         self.services.audio.stop();
         let saved = self
             .services
@@ -312,8 +296,8 @@ impl Station {
         match event {
             StationEvent::Audio(event) => {
                 let is_progress = matches!(event, AudioEvent::Progress { .. });
-                let effects = self.session.audio_event(event);
-                self.execute(effects);
+                self.session.audio_event(event);
+                self.execute();
                 if is_progress {
                     self.progress_at = Some(std::time::Instant::now());
                     // Progress only changes numbers in the header and the active row.
@@ -326,13 +310,13 @@ impl Station {
                 key,
                 result,
             } => {
-                let effects = self.session.track_prepared(request, &key, result);
-                self.execute(effects);
+                self.session.track_prepared(request, &key, result);
+                self.execute();
             }
             StationEvent::LibraryChanged => {
                 self.library_revision += 1;
-                let effects = self.session.library_changed();
-                self.execute(effects);
+                self.session.library_changed();
+                self.execute();
             }
             StationEvent::CacheChanged => {
                 self.cache_status = self.services.youtube.cache_status();
@@ -349,8 +333,8 @@ impl Station {
         cx.notify();
     }
 
-    fn execute(&mut self, effects: Vec<Effect>) {
-        for effect in effects {
+    fn execute(&mut self) {
+        for effect in self.session.take_effects() {
             match effect {
                 Effect::Audio(command) => self.audio(command),
                 Effect::Prepare { request, track } => self.prepare(request, track),
@@ -359,24 +343,8 @@ impl Station {
                 Effect::SavePlayLogEntry(entry) => {
                     self.services.persistence.save_play_log_entry(entry)
                 }
-                Effect::ClearPlayLog => {
-                    // Fire-and-forget path; failures surface as an error banner.
-                    let receiver = self.services.persistence.clear_play_log();
-                    let events = self.events.clone();
-                    self.services.runtime.spawn(async move {
-                        if let Ok(Err(error)) = receiver.await {
-                            let _ = events.unbounded_send(StationEvent::Error(format!(
-                                "Play log could not be cleared: {error}"
-                            )));
-                        }
-                    });
-                }
                 Effect::ProtectTracks(tracks) => {
-                    let ids = tracks
-                        .into_iter()
-                        .filter(|track| track.source == SourceId::YoutubeMusic)
-                        .map(|track| track.id)
-                        .collect();
+                    let ids = youtube_ids(tracks.iter());
                     let _ = self.cache_ops.send(CacheOp::Protect(ids));
                 }
                 Effect::RecordYoutubePlay(video_id) => {
@@ -453,6 +421,14 @@ fn spawn_cache_worker(services: &Arc<Services>) -> tokio::sync::mpsc::UnboundedS
         }
     });
     sender
+}
+
+/// The video ids of the YouTube Tracks among `tracks`.
+fn youtube_ids<'a>(tracks: impl Iterator<Item = &'a Track>) -> Vec<String> {
+    tracks
+        .filter(|track| track.source == SourceId::YoutubeMusic)
+        .map(|track| track.id.clone())
+        .collect()
 }
 
 /// The store prefixes recovery errors; the Session adds its own prefix.

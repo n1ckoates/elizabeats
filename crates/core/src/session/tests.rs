@@ -988,7 +988,7 @@ fn play_log_loads_and_clears() {
     h.session.play_log_loaded(Ok(vec![older.clone()]));
     assert_eq!(h.session.play_log(), &[older]);
     h.session.clear_play_log();
-    assert_eq!(h.collect(), vec![Effect::ClearPlayLog]);
+    assert!(h.collect().is_empty());
     assert!(h.session.play_log().is_empty());
     h.session.play_log_loaded(Err("bad".into()));
     assert_eq!(

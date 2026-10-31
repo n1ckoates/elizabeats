@@ -5,7 +5,6 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use chrono::{Local, NaiveDate};
-use elizabeats_core::session::RecoveryState;
 use gpui_kit::component::date_picker::{DatePickerEvent, DatePickerState};
 use gpui_kit::component::dialog::AlertDialog;
 use gpui_kit::component::input::{InputEvent, InputState};
@@ -239,17 +238,12 @@ impl AppView {
     // ---- Dialogs -----------------------------------------------------------
 
     fn show_recovery_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let RecoveryState::Pending(snapshot) = self.station.read(cx).session().recovery().clone()
-        else {
+        let Some(snapshot) = self.station.read(cx).session().pending_recovery() else {
             return;
         };
         self.recovery_prompted = true;
         let count = snapshot.queue.len();
-        let first = match snapshot.queue.first() {
-            Some(elizabeats_core::StoredQueueItem::Track { track, .. }) => track.title.clone(),
-            Some(elizabeats_core::StoredQueueItem::Break { .. }) => "Break".to_owned(),
-            None => "Queue".to_owned(),
-        };
+        let first = snapshot.queue.first().map_or("Queue", |item| item.title());
         let summary: SharedString = format!(
             "{count} queue {} saved, starting with “{first}”. Playback will remain stopped.",
             if count == 1 { "item" } else { "items" }
@@ -425,12 +419,7 @@ impl Focusable for AppView {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.recovery_prompted
-            && matches!(
-                self.station.read(cx).session().recovery(),
-                RecoveryState::Pending(_)
-            )
-        {
+        if !self.recovery_prompted && self.station.read(cx).session().pending_recovery().is_some() {
             self.show_recovery_dialog(window, cx);
         }
         // gpui-kit's dialogs fade and slide in, with no option to turn that
@@ -448,9 +437,7 @@ impl Render for AppView {
             .session()
             .queue()
             .active()
-            .is_some_and(|active| {
-                matches!(active.kind, elizabeats_core::queue::ItemKind::Track(_))
-            });
+            .is_some_and(|active| active.item.as_track().is_some());
         if track_playing {
             window.request_animation_frame();
         }

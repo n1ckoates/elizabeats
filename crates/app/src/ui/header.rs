@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Local, Timelike};
 use elizabeats_core::format::format_duration;
-use elizabeats_core::queue::{ItemKind, Queue};
+use elizabeats_core::queue::Queue;
 use elizabeats_core::session::Session;
 use elizabeats_core::timing::{KnownDuration, estimate_until_next_break, queued_track_duration};
 use gpui_kit::assets::IconName as Lucide;
@@ -55,7 +55,7 @@ pub fn metrics(session: &Session, now: DateTime<Local>) -> Metrics {
     let next_hour = 3600.0 - seconds_into_hour;
     let queue: &Queue = session.queue();
     let active = queue.active();
-    let is_break = active.is_some_and(|item| matches!(item.kind, ItemKind::Break));
+    let is_break = active.is_some_and(|active| active.item.as_track().is_none());
 
     let (current_label, current_value) = if is_break {
         let started = session
@@ -66,15 +66,13 @@ pub fn metrics(session: &Session, now: DateTime<Local>) -> Metrics {
         });
         ("Break elapsed", elapsed(seconds))
     } else {
-        let remaining = active.and_then(|item| match &item.kind {
-            ItemKind::Track(track) => {
-                if item.progress.duration > 0.0 {
-                    Some((item.progress.duration - item.progress.current_time).max(0.0))
-                } else {
-                    track.duration_seconds
-                }
+        let remaining = active.and_then(|active| {
+            let progress = active.progress;
+            if progress.duration > 0.0 {
+                Some((progress.duration - progress.current_time).max(0.0))
+            } else {
+                active.item.as_track()?.duration_seconds
             }
-            ItemKind::Break => None,
         });
         ("Track remaining", countdown(remaining))
     };

@@ -150,13 +150,13 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use elizabeats_core::{RecoveryStatus, StoredQueueItem};
+    use elizabeats_core::{QueueItem, RecoveryStatus};
 
     fn snapshot(id: &str) -> RecoverySnapshot {
         RecoverySnapshot {
             version: 1,
             status: RecoveryStatus::Interrupted,
-            queue: vec![StoredQueueItem::Break { id: id.into() }],
+            queue: vec![QueueItem::new_break(id)],
             session_started_at: None,
             updated_at: "2026-01-01T00:00:00.000Z".into(),
         }
@@ -173,7 +173,7 @@ mod tests {
         let saved = elizabeats_store::read_recovery(dir.path())
             .unwrap()
             .unwrap();
-        assert_eq!(saved.queue[0].id(), "b49");
+        assert_eq!(saved.queue[0].id, "b49");
 
         persistence.discard_recovery();
         assert!(persistence.flush_blocking(Duration::from_secs(5)));

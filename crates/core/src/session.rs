@@ -52,22 +52,18 @@ pub enum AudioCommand {
 /// Notifications from the audio engine.
 #[derive(Clone, Debug, PartialEq)]
 pub enum AudioEvent {
+    /// Periodic (~every 100 ms) while a deck with this id is loaded and playing.
     Progress {
         id: LoadId,
         position_secs: f64,
         duration_secs: Option<f64>,
     },
-    Ended {
-        id: LoadId,
-    },
-    Failed {
-        id: LoadId,
-        message: String,
-    },
-    CrossfadeComplete {
-        outgoing: LoadId,
-        incoming: LoadId,
-    },
+    /// The deck's audio has fully played out to the device.
+    Ended { id: LoadId },
+    /// The deck failed (file missing/undecodable, decode error mid-stream, output device lost).
+    Failed { id: LoadId, message: String },
+    /// A crossfade's gain ramps finished (outgoing is now silent, incoming at full gain).
+    CrossfadeComplete { outgoing: LoadId, incoming: LoadId },
 }
 
 /// Work the application performs on the Session's behalf.
@@ -83,7 +79,6 @@ pub enum Effect {
     DiscardRecovery,
     /// Insert or replace (by entry id) one Play Log entry.
     SavePlayLogEntry(PlayLogEntry),
-    ClearPlayLog,
     /// Tracks in the Queue must not be evicted from the Download Cache.
     ProtectTracks(Vec<Track>),
     RecordYoutubePlay(String),
@@ -438,9 +433,9 @@ impl Session {
         }
     }
 
+    /// Forgets the in-memory Play Log; the caller deletes the stored one.
     pub fn clear_play_log(&mut self) {
         self.play_log.clear();
-        self.effects.push(Effect::ClearPlayLog);
     }
 
     /// Stops audio, closes Playing log entries, and saves a clean snapshot.

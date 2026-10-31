@@ -15,7 +15,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use elizabeats_audio::AudioEngine;
-use elizabeats_core::session::AudioEvent;
 use elizabeats_library::LocalLibrary;
 use elizabeats_youtube::{YoutubeConfig, YoutubeMusic};
 use gpui_kit::component::TitleBar;
@@ -158,24 +157,6 @@ pub fn bootstrap(launch: Launch) -> Result<StationParts, String> {
 
     let audio_events = events.clone();
     let audio = AudioEngine::new(move |event| {
-        let event = match event {
-            elizabeats_audio::AudioEvent::Progress {
-                id,
-                position_secs,
-                duration_secs,
-            } => AudioEvent::Progress {
-                id,
-                position_secs,
-                duration_secs,
-            },
-            elizabeats_audio::AudioEvent::Ended { id } => AudioEvent::Ended { id },
-            elizabeats_audio::AudioEvent::Failed { id, message } => {
-                AudioEvent::Failed { id, message }
-            }
-            elizabeats_audio::AudioEvent::CrossfadeComplete { outgoing, incoming } => {
-                AudioEvent::CrossfadeComplete { outgoing, incoming }
-            }
-        };
         let _ = audio_events.unbounded_send(StationEvent::Audio(event));
     });
 

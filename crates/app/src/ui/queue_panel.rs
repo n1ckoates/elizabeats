@@ -1,8 +1,9 @@
 //! The Queue panel: Active Item pinned on top, Upcoming items below.
 
 use elizabeats_core::format::format_duration;
-use elizabeats_core::queue::{Direction, ItemKind, QueueItemRef, Readiness};
-use elizabeats_core::{SourceId, Track};
+use elizabeats_core::queue::{Direction, QueueItemRef};
+use elizabeats_core::session::{Readiness, Session};
+use elizabeats_core::{ItemKind, SourceId, Track};
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -56,32 +57,29 @@ enum Role {
 impl RowModel {
     /// `played_since_report` moves Playing items' positions on smoothly
     /// between the engine's progress reports.
-    fn from_item(index: usize, item: QueueItemRef<'_>, played_since_report: f64) -> Self {
-        let playing_progress = |progress: elizabeats_core::PlaybackProgress| {
+    fn new(
+        index: usize,
+        item: QueueItemRef<'_>,
+        session: &Session,
+        played_since_report: f64,
+    ) -> Self {
+        let role = match item {
+            QueueItemRef::Active(_) => Role::Active,
+            QueueItemRef::Incoming(_) => Role::Incoming,
+            QueueItemRef::Upcoming(_) => Role::Upcoming,
+        };
+        let progress = item.progress().map_or((0.0, 0.0), |progress| {
             (
                 progress.current_time + played_since_report,
                 progress.duration,
             )
-        };
-        let (role, readiness, progress) = match item {
-            QueueItemRef::Active(playing) => (
-                Role::Active,
-                Readiness::Ready,
-                playing_progress(playing.progress),
-            ),
-            QueueItemRef::Incoming(playing) => (
-                Role::Incoming,
-                Readiness::Ready,
-                playing_progress(playing.progress),
-            ),
-            QueueItemRef::Upcoming(upcoming) => (Role::Upcoming, upcoming.readiness, (0.0, 0.0)),
-        };
+        });
         Self {
             index,
             id: item.id().to_owned(),
             kind: item.kind().clone(),
             role,
-            readiness,
+            readiness: session.readiness(item),
             progress,
         }
     }
@@ -106,11 +104,7 @@ impl RowModel {
     }
 }
 
-fn station_command(
-    station: &Entity<Station>,
-    cx: &mut App,
-    run: impl FnOnce(&mut elizabeats_core::session::Session) -> Vec<elizabeats_core::session::Effect>,
-) {
+fn station_command(station: &Entity<Station>, cx: &mut App, run: impl FnOnce(&mut Session)) {
     station.update(cx, |station, cx| station.command(cx, run));
 }
 
@@ -130,7 +124,7 @@ impl AppView {
         let rows: Vec<RowModel> = queue
             .items()
             .enumerate()
-            .map(|(index, item)| RowModel::from_item(index, item, played_since_report))
+            .map(|(index, item)| RowModel::new(index, item, session, played_since_report))
             .collect();
         let crossfading = queue.is_crossfading();
         let error = session
@@ -393,7 +387,7 @@ impl AppView {
             return;
         };
         station_command(&self.station, cx, move |session| match action {
-            DropAction::InsertTrack { track, at } => session.insert_track_at(track, at, None),
+            DropAction::InsertTrack { track, at } => session.insert_track_at(track, at),
             DropAction::InsertBreak { at } => session.insert_break_at(at),
             DropAction::Move { item_ids, slot } => session.move_items(&item_ids, slot),
         });
@@ -860,7 +854,7 @@ impl AppView {
     /// IDs of the items that can be selected (the Upcoming ones), in order.
     pub(super) fn selectable_ids(&self, cx: &App) -> Vec<String> {
         let queue = self.station.read(cx).session().queue();
-        queue.queued().iter().map(|item| item.id.clone()).collect()
+        queue.upcoming.iter().map(|item| item.id.clone()).collect()
     }
 
     /// The selectable item one step up or down from the focused row.

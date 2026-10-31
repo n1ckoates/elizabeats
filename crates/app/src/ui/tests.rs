@@ -5,8 +5,9 @@
 use std::path::Path;
 use std::time::Duration;
 
-use elizabeats_core::queue::ItemKind;
-use elizabeats_core::{AppSettings, RecoverySnapshot, RecoveryStatus, StoredQueueItem};
+use elizabeats_core::queue::QueueItemRef;
+use elizabeats_core::session::Readiness;
+use elizabeats_core::{AppSettings, ItemKind, QueueItem, RecoverySnapshot, RecoveryStatus};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
     AnyWindowHandle, AppContext, Bounds, Entity, Point, TestAppContext, WindowBounds,
@@ -86,7 +87,7 @@ async fn starts_empty_and_add_break_inserts_a_break(cx: &mut TestAppContext) {
     assert_eq!(queue_len(&view, cx), 1);
     let is_break = view.read_with(cx, |view, cx| {
         let station = view.station.read(cx);
-        matches!(station.session().queue().queued()[0].kind, ItemKind::Break)
+        matches!(station.session().queue().upcoming[0].kind, ItemKind::Break)
     });
     assert!(is_break);
 }
@@ -115,7 +116,7 @@ async fn delete_key_removes_the_focused_row(cx: &mut TestAppContext) {
         });
     });
     let first = view.read_with(cx, |view, cx| {
-        view.station.read(cx).session().queue().queued()[0]
+        view.station.read(cx).session().queue().upcoming[0]
             .id
             .clone()
     });
@@ -131,7 +132,7 @@ async fn delete_key_removes_the_focused_row(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(queue_len(&view, cx), 1);
     let remaining = view.read_with(cx, |view, cx| {
-        view.station.read(cx).session().queue().queued()[0]
+        view.station.read(cx).session().queue().upcoming[0]
             .id
             .clone()
     });
@@ -145,12 +146,8 @@ fn write_interrupted_recovery(dir: &Path) {
             version: 1,
             status: RecoveryStatus::Interrupted,
             queue: vec![
-                StoredQueueItem::Break {
-                    id: "saved-1".into(),
-                },
-                StoredQueueItem::Break {
-                    id: "saved-2".into(),
-                },
+                QueueItem::new_break("saved-1"),
+                QueueItem::new_break("saved-2"),
             ],
             session_started_at: Some("2026-10-06T20:00:00.000Z".into()),
             updated_at: "2026-10-06T21:00:00.000Z".into(),
@@ -262,7 +259,7 @@ async fn local_track_can_be_dragged_from_search_into_the_queue(cx: &mut TestAppC
     cx.run_until_parked();
     assert_eq!(queue_len(&view, cx), 1);
     let title = view.read_with(cx, |view, cx| {
-        view.station.read(cx).session().queue().queued()[0]
+        view.station.read(cx).session().queue().upcoming[0]
             .kind
             .clone()
     });
@@ -270,7 +267,7 @@ async fn local_track_can_be_dragged_from_search_into_the_queue(cx: &mut TestAppC
 
     // A queued Track's row is exactly as tall as its search result row.
     let id = view.read_with(cx, |view, cx| {
-        view.station.read(cx).session().queue().queued()[0]
+        view.station.read(cx).session().queue().upcoming[0]
             .id
             .clone()
     });
@@ -350,12 +347,11 @@ async fn plays_local_tracks_end_to_end(cx: &mut TestAppContext) {
             .read(cx)
             .session()
             .queue()
-            .queued()
-            .iter()
-            .all(|item| item.readiness == elizabeats_core::queue::Readiness::Ready)
+            .items()
+            .all(|item| view.station.read(cx).session().readiness(item) == Readiness::Ready)
     });
     let first = view.read_with(cx, |view, cx| {
-        view.station.read(cx).session().queue().queued()[0]
+        view.station.read(cx).session().queue().upcoming[0]
             .id
             .clone()
     });
@@ -390,8 +386,6 @@ async fn plays_local_tracks_end_to_end(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 #[ignore = "needs network access to YouTube and a built app binary"]
 async fn youtube_track_downloads_and_becomes_ready(cx: &mut TestAppContext) {
-    use elizabeats_core::queue::Readiness;
-
     let dir = tempfile::tempdir().unwrap();
     let helper =
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/elizabeats");
@@ -430,7 +424,7 @@ async fn youtube_track_downloads_and_becomes_ready(cx: &mut TestAppContext) {
         let (readiness, error) = station.read_with(cx, |station, _| {
             let session = station.session();
             (
-                session.queue().queued()[0].readiness,
+                session.readiness(QueueItemRef::Upcoming(&session.queue().upcoming[0])),
                 session.playback_error().map(str::to_owned),
             )
         });
@@ -473,7 +467,7 @@ async fn cannot_drop_above_the_active_item(cx: &mut TestAppContext) {
     });
     let (active, upcoming) = view.read_with(cx, |view, cx| {
         let queue = view.station.read(cx).session().queue();
-        (queue.queued()[0].id.clone(), queue.queued()[1].id.clone())
+        (queue.upcoming[0].id.clone(), queue.upcoming[1].id.clone())
     });
     // Playing a Break makes it the Active Item without any audio.
     view.update(cx, |view, cx| {
@@ -862,7 +856,7 @@ async fn only_upcoming_items_can_be_selected(cx: &mut TestAppContext) {
     });
     let (active, upcoming) = view.read_with(cx, |view, cx| {
         let queue = view.station.read(cx).session().queue();
-        (queue.queued()[0].id.clone(), queue.queued()[1].id.clone())
+        (queue.upcoming[0].id.clone(), queue.upcoming[1].id.clone())
     });
     // Playing a Break makes it the Active Item without any audio.
     view.update(cx, |view, cx| {
