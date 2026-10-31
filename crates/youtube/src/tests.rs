@@ -8,13 +8,14 @@ use serde_json::{Value, json};
 
 use super::*;
 
-/// A fake fetcher: takes `delay`, then writes `size` bytes.
+/// A fake fetcher: takes `delay`, then writes `size` bytes (or fails with a
+/// 403 when `fail` is set).
 struct FakeFetcher {
     delay: Duration,
     size: usize,
+    fail: bool,
     /// (video ID, start time, end time) of each fetch.
     calls: StdMutex<Vec<(String, Instant, Instant)>>,
-    fail_ids: HashSet<String>,
 }
 
 impl FakeFetcher {
@@ -22,8 +23,8 @@ impl FakeFetcher {
         Arc::new(Self {
             delay,
             size,
+            fail: false,
             calls: StdMutex::new(Vec::new()),
-            fail_ids: HashSet::new(),
         })
     }
 
@@ -36,29 +37,21 @@ impl AudioFetcher for FakeFetcher {
     fn fetch<'a>(
         &'a self,
         video_id: &'a str,
-        files: &'a CacheFiles,
-    ) -> BoxFuture<'a, Result<FetchedAudio, YoutubeError>> {
+        part: &'a mut PartFile,
+    ) -> BoxFuture<'a, Result<(), YoutubeError>> {
         Box::pin(async move {
             let start = Instant::now();
-            let file_name = format!("{video_id}.m4a");
-            let mut part = files.begin(&file_name).await.map_err(YoutubeError::cache)?;
             tokio::time::sleep(self.delay).await;
             self.calls
                 .lock()
                 .unwrap()
                 .push((video_id.to_owned(), start, Instant::now()));
-            if self.fail_ids.contains(video_id) {
+            if self.fail {
                 return Err(YoutubeError::DownloadForbidden);
             }
             part.write_all(&vec![0u8; self.size])
                 .await
-                .map_err(YoutubeError::cache)?;
-            let byte_size = part.finish().await.map_err(YoutubeError::cache)?;
-            Ok(FetchedAudio {
-                file_name,
-                byte_size,
-                client_type: "Fake".into(),
-            })
+                .map_err(YoutubeError::cache)
         })
     }
 }
@@ -80,8 +73,7 @@ impl Harness {
         let events = Arc::new(StdMutex::new(Vec::new()));
         let changes = Arc::new(AtomicUsize::new(0));
         let config = config(temp.path().to_owned(), events.clone(), changes.clone());
-        let source = Arc::new(YoutubeSource::new(None).unwrap());
-        let youtube = YoutubeMusic::with_parts(config, source, fetcher, Timing::default());
+        let youtube = YoutubeMusic::with_fetcher(config, fetcher).unwrap();
         Self {
             youtube: Arc::new(youtube),
             temp,
@@ -230,8 +222,8 @@ async fn failures_reach_every_waiter_and_can_be_retried() {
     let fetcher = Arc::new(FakeFetcher {
         delay: Duration::from_secs(1),
         size: 100,
+        fail: true,
         calls: StdMutex::new(Vec::new()),
-        fail_ids: HashSet::from([id(1)]),
     });
     let h = Harness::new(fetcher.clone());
     h.youtube.initialize(1 << 30, vec![]).await.unwrap();
@@ -357,48 +349,38 @@ async fn trims_in_eviction_order_and_respects_protection() {
 }
 
 /// Acts like a full disk (the OS's "no space left" error) while `blocker`
-/// is still in the cache folder.
+/// still exists.
 struct DiskFullFetcher {
-    blocker: &'static str,
+    blocker: PathBuf,
     calls: AtomicUsize,
 }
 
 impl AudioFetcher for DiskFullFetcher {
     fn fetch<'a>(
         &'a self,
-        video_id: &'a str,
-        files: &'a CacheFiles,
-    ) -> BoxFuture<'a, Result<FetchedAudio, YoutubeError>> {
+        _video_id: &'a str,
+        part: &'a mut PartFile,
+    ) -> BoxFuture<'a, Result<(), YoutubeError>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let file_name = format!("{video_id}.m4a");
-            let mut part = files
-                .begin(&file_name)
-                .await
-                .map_err(YoutubeError::cache_write)?;
-            if files.size(self.blocker).await.is_some() {
+            if self.blocker.exists() {
                 let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
                 return Err(YoutubeError::cache_write(full));
             }
             part.write_all(&[0u8; 10])
                 .await
-                .map_err(YoutubeError::cache_write)?;
-            let byte_size = part.finish().await.map_err(YoutubeError::cache_write)?;
-            Ok(FetchedAudio {
-                file_name,
-                byte_size,
-                client_type: "Fake".into(),
-            })
+                .map_err(YoutubeError::cache_write)
         })
     }
 }
 
-fn disk_full_harness(blocker: &'static str) -> (Harness, Arc<DiskFullFetcher>) {
+fn disk_full_harness(blocker: &str) -> (Harness, Arc<DiskFullFetcher>) {
+    let temp = tempfile::tempdir().unwrap();
     let fetcher = Arc::new(DiskFullFetcher {
-        blocker,
+        blocker: temp.path().join("download-cache").join(blocker),
         calls: AtomicUsize::new(0),
     });
-    let h = Harness::new(fetcher.clone());
+    let h = Harness::in_dir(temp, fetcher.clone());
     h.write_manifest(&json!({"version": 1, "entries": [
         {"videoId": "queuedtrack", "fileName": "queuedtrack.m4a", "byteSize": 10, "playCount": 0},
         {"videoId": "othertrack1", "fileName": "othertrack1.m4a", "byteSize": 10, "playCount": 5},
@@ -555,6 +537,30 @@ mod live {
         let events = Arc::new(StdMutex::new(Vec::new()));
         let config = config(temp.path().to_owned(), events.clone(), Arc::default());
         (YoutubeMusic::new(config).unwrap(), temp, events)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs network"]
+    async fn live_search_timing() {
+        // As in the app: warm up at launch, then the DJ types a query.
+        let (youtube, _temp, _) = live_youtube();
+        youtube.prewarm();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        for query in [
+            "daft punk one more time",
+            "kendrick lamar humble",
+            "taylor swift",
+            "olivia rodrigo good 4 u",
+            "macklemore thrift shop",
+        ] {
+            let started = std::time::Instant::now();
+            let tracks = youtube.search(query).await.unwrap();
+            println!(
+                "{query:<26} {:>4} ms ({} tracks)",
+                started.elapsed().as_millis(),
+                tracks.len()
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
