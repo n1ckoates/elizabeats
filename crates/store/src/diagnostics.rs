@@ -3,7 +3,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -12,10 +12,11 @@ use elizabeats_core::{DiagnosticEvent, DiagnosticSink};
 use regex::Regex;
 use serde::Serialize;
 
+const FILE: &str = "diagnostics.jsonl";
 /// Rotate before the file would grow past this size.
-pub const MAX_DIAGNOSTICS_BYTES: u64 = 512 * 1024;
+const MAX_DIAGNOSTICS_BYTES: u64 = 512 * 1024;
 /// Rotated files kept: `diagnostics.jsonl.1` (newest) to `.3` (oldest).
-pub const MAX_ROTATED_FILES: u32 = 3;
+const MAX_ROTATED_FILES: u32 = 3;
 const MAX_TEXT_CHARS: usize = 500;
 /// Events waiting to be written; more than this are dropped.
 const QUEUE_CAPACITY: usize = 1024;
@@ -48,7 +49,7 @@ static REDACTIONS: LazyLock<Option<Vec<(Regex, &'static str)>>> = LazyLock::new(
 
 /// Removes URLs, credentials, and tokens from `value`, trims it, and limits
 /// it to 500 characters.
-pub fn redact(value: &str) -> String {
+fn redact(value: &str) -> String {
     let Some(redactions) = REDACTIONS.as_ref() else {
         // Never write unredacted text.
         return "[redaction unavailable]".to_owned();
@@ -92,25 +93,21 @@ enum Message {
 /// failures are ignored.
 pub struct DiagnosticsStore {
     sender: SyncSender<Message>,
-    path: PathBuf,
 }
 
 impl DiagnosticsStore {
-    pub fn new(path: PathBuf) -> Self {
+    /// Writes to `diagnostics.jsonl` in `dir`.
+    pub fn new(dir: &Path) -> Self {
         let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
-        let writer_path = path.clone();
+        let path = dir.join(FILE);
         let spawned = std::thread::Builder::new()
             .name("diagnostics".into())
-            .spawn(move || run_writer(&writer_path, &receiver));
+            .spawn(move || run_writer(path, &receiver));
         if let Err(error) = spawned {
             // Diagnostics are optional; without the thread, events are dropped.
             tracing::warn!("Diagnostics are disabled: {error}");
         }
-        Self { sender, path }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
+        Self { sender }
     }
 
     /// Queues `event` for writing. Never blocks.
@@ -133,17 +130,16 @@ impl DiagnosticsStore {
     }
 }
 
+/// Drops the event when the writer is far behind or gone.
 fn record_with(sender: &SyncSender<Message>, event: DiagnosticEvent) {
     let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-    match sender.try_send(Message::Event { timestamp, event }) {
-        Ok(()) | Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {}
-    }
+    let _ = sender.try_send(Message::Event { timestamp, event });
 }
 
 /// Runs until every sender (the store and all sinks) is gone.
-fn run_writer(path: &Path, receiver: &Receiver<Message>) {
+fn run_writer(path: PathBuf, receiver: &Receiver<Message>) {
     let mut writer = Writer {
-        path: path.to_path_buf(),
+        path,
         file: None,
         size: 0,
     };
@@ -339,8 +335,8 @@ mod tests {
     #[test]
     fn writes_sanitized_events_with_timestamps() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("diagnostics.jsonl");
-        let store = DiagnosticsStore::new(path.clone());
+        let path = dir.path().join(FILE);
+        let store = DiagnosticsStore::new(dir.path());
         let mut event = DiagnosticEvent::new(" download ")
             .source(SourceId::YoutubeMusic)
             .video_id("abc")
@@ -387,8 +383,8 @@ mod tests {
     #[test]
     fn rotates_and_keeps_three_old_files() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("diagnostics.jsonl");
-        let store = DiagnosticsStore::new(path.clone());
+        let path = dir.path().join(FILE);
+        let store = DiagnosticsStore::new(dir.path());
         // ~520-byte lines: about 1000 per file.
         let error = "e".repeat(480);
         for round in 0..5 {
@@ -433,7 +429,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let blocker = dir.path().join("file");
         fs::write(&blocker, "x").unwrap();
-        let store = DiagnosticsStore::new(blocker.join("diagnostics.jsonl"));
+        let store = DiagnosticsStore::new(&blocker);
         store.record(DiagnosticEvent::new("x"));
         store.flush();
     }

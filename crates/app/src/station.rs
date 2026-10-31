@@ -114,8 +114,7 @@ impl Station {
         // Startup reads are small local files; doing them now means the first
         // frame already knows whether to offer recovery.
         session.recovery_loaded(
-            elizabeats_store::read_recovery(&services.data_dir)
-                .map_err(|error| strip_prefix(&error.to_string())),
+            elizabeats_store::read_recovery(&services.data_dir).map_err(|error| error.to_string()),
         );
         let protected = youtube_ids(
             session
@@ -429,12 +428,4 @@ fn youtube_ids<'a>(tracks: impl Iterator<Item = &'a Track>) -> Vec<String> {
         .filter(|track| track.source == SourceId::YoutubeMusic)
         .map(|track| track.id.clone())
         .collect()
-}
-
-/// The store prefixes recovery errors; the Session adds its own prefix.
-fn strip_prefix(message: &str) -> String {
-    message
-        .strip_prefix("Queue recovery could not be read: ")
-        .unwrap_or(message)
-        .to_owned()
 }

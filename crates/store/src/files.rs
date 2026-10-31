@@ -1,8 +1,8 @@
-//! Crash-safe file replacement.
+//! Crash-safe file helpers. Every file lives directly in the data folder.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::StoreError;
@@ -10,23 +10,48 @@ use crate::StoreError;
 /// Marks temporary files so leftovers from a crash can be recognised.
 const TEMP_MARKER: &str = ".tmp-";
 
-/// Replaces `path` with `bytes` atomically: the data is written and synced to
-/// a temporary file in the same folder, which is then renamed over `path`.
+/// The contents of `dir/name`, or `None` when it does not exist.
+pub(crate) fn read_optional(dir: &Path, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
+    let path = dir.join(name);
+    match fs::read(&path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(StoreError::io("read", &path, source)),
+    }
+}
+
+/// Replaces `dir/name` with `bytes` atomically: the data is written and synced
+/// to a temporary file in `dir`, which is then renamed over the real file.
 /// Readers (and a crash at any moment) see either the old or the new file.
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    let dir = parent_dir(path);
+pub(crate) fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), StoreError> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     fs::create_dir_all(dir).map_err(|source| StoreError::io("create", dir, source))?;
-    let temp = temp_path(path);
+    let path = dir.join(name);
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp = dir.join(format!(
+        ".{name}{TEMP_MARKER}{}-{count}",
+        std::process::id()
+    ));
     let result = write_and_sync(&temp, bytes)
         .map_err(|source| StoreError::io("write", &temp, source))
         .and_then(|()| {
-            fs::rename(&temp, path).map_err(|source| StoreError::io("replace", path, source))
+            fs::rename(&temp, &path).map_err(|source| StoreError::io("replace", &path, source))
         });
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
     result?;
-    sync_dir(dir).map_err(|source| StoreError::io("sync", dir, source))
+    sync_dir(dir)
+}
+
+/// Removes `dir/name`, treating "already gone" as success.
+pub(crate) fn remove_file(dir: &Path, name: &str) -> Result<(), StoreError> {
+    let path = dir.join(name);
+    match fs::remove_file(&path) {
+        Ok(()) => sync_dir(dir),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(StoreError::io("delete", &path, source)),
+    }
 }
 
 /// Deletes temporary files left behind by a crash mid-write. Call once at
@@ -51,47 +76,16 @@ fn write_and_sync(temp: &Path, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
-pub(crate) fn parent_dir(path: &Path) -> &Path {
-    match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    }
-}
-
-fn temp_path(path: &Path) -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    parent_dir(path).join(format!(
-        ".{name}{TEMP_MARKER}{}-{count}",
-        std::process::id()
-    ))
-}
-
-/// Makes a rename or file creation in `dir` durable.
-#[cfg(unix)]
-pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
-    fs::File::open(dir)?.sync_all()
-}
-
-/// Windows cannot open folders as files; NTFS journals renames itself.
-#[cfg(not(unix))]
-pub(crate) fn sync_dir(_dir: &Path) -> io::Result<()> {
+/// Makes a rename or file creation in `dir` durable. (Windows cannot open
+/// folders as files; NTFS journals renames itself.)
+pub(crate) fn sync_dir(dir: &Path) -> Result<(), StoreError> {
+    #[cfg(unix)]
+    fs::File::open(dir)
+        .and_then(|folder| folder.sync_all())
+        .map_err(|source| StoreError::io("sync", dir, source))?;
+    #[cfg(not(unix))]
+    let _ = dir;
     Ok(())
-}
-
-/// Removes `path`, treating "already gone" as success.
-pub(crate) fn remove_file_durably(path: &Path) -> Result<(), StoreError> {
-    match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(source) => return Err(StoreError::io("delete", path, source)),
-    }
-    let dir = parent_dir(path);
-    sync_dir(dir).map_err(|source| StoreError::io("sync", dir, source))
 }
 
 #[cfg(test)]
@@ -101,10 +95,9 @@ mod tests {
     #[test]
     fn replaces_contents_and_leaves_no_temp_files() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.json");
-        write_atomic(&path, b"one").unwrap();
-        write_atomic(&path, b"two").unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"two");
+        write_atomic(dir.path(), "file.json", b"one").unwrap();
+        write_atomic(dir.path(), "file.json", b"two").unwrap();
+        assert_eq!(fs::read(dir.path().join("file.json")).unwrap(), b"two");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
@@ -112,15 +105,14 @@ mod tests {
     fn crash_leftovers_do_not_affect_the_real_file_and_are_cleaned_up() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        write_atomic(&path, b"good").unwrap();
+        write_atomic(dir.path(), "settings.json", b"good").unwrap();
         // What a crash between "create temp" and "rename" leaves behind.
         let leftover = dir.path().join(".settings.json.tmp-999-0");
         fs::write(&leftover, b"half-writ").unwrap();
         let unrelated = dir.path().join("play-log.jsonl");
         fs::write(&unrelated, b"keep").unwrap();
 
-        assert_eq!(fs::read(&path).unwrap(), b"good");
-        write_atomic(&path, b"better").unwrap();
+        write_atomic(dir.path(), "settings.json", b"better").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"better");
 
         remove_stale_temp_files(dir.path());
@@ -130,11 +122,11 @@ mod tests {
     }
 
     #[test]
-    fn creates_missing_parent_folders() {
+    fn creates_a_missing_folder() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a/b/c.json");
-        write_atomic(&path, b"x").unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"x");
+        let folder = dir.path().join("a/b");
+        write_atomic(&folder, "c.json", b"x").unwrap();
+        assert_eq!(read_optional(&folder, "c.json").unwrap().unwrap(), b"x");
     }
 
     #[test]
@@ -144,7 +136,7 @@ mod tests {
         let path = dir.path().join("target");
         fs::create_dir(&path).unwrap();
         fs::write(path.join("inside"), b"x").unwrap();
-        let error = write_atomic(&path, b"new").unwrap_err();
+        let error = write_atomic(dir.path(), "target", b"new").unwrap_err();
         assert!(
             error.to_string().starts_with("Could not replace"),
             "{error}"
@@ -152,5 +144,12 @@ mod tests {
         assert!(path.join("inside").exists());
         // The temporary file was removed.
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn missing_files_read_as_none_and_remove_quietly() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_optional(dir.path(), "nope").unwrap().is_none());
+        remove_file(dir.path(), "nope").unwrap();
     }
 }
