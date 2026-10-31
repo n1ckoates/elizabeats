@@ -1,0 +1,25 @@
+[package]
+name = "elizabeats-store"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+elizabeats-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+# Per-user app data folder lookup.
+dirs = "6"
+# Diagnostic redaction. Unicode `\s` and case folding match the original
+# JavaScript patterns; other regex features are left off.
+regex = { version = "1", default-features = false, features = ["std", "unicode-perl", "unicode-case"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

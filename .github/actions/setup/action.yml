@@ -1,0 +1,54 @@
+name: Set up build tools
+description: Rust (from rust-toolchain.toml), Node + pnpm for the BotGuard JS bundle, and per-OS system dependencies.
+
+inputs:
+  cache-key:
+    description: Keeps the Rust build cache of jobs that would otherwise share one (e.g. two macOS packaging jobs for different chips) apart.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install Linux libraries
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          pkg-config \
+          libwebkit2gtk-4.1-dev libgtk-3-dev \
+          libasound2-dev libssl-dev \
+          libfontconfig-dev libfreetype-dev \
+          libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev
+
+    # gpui compiles its Metal shaders at build time; newer Xcode versions
+    # download the Metal compiler separately.
+    - name: Install the Metal shader compiler
+      if: runner.os == 'macOS'
+      shell: bash
+      run: xcrun metal --version >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+
+    # crates/botguard/build.rs bundles youtubei.js with Node and pnpm (and runs
+    # `pnpm install` itself, so this step doesn't).
+    - uses: pnpm/setup@v3
+      with:
+        version: 12
+        runtime: node@26
+        install: false
+        # Caches the downloaded JS packages.
+        cache: true
+        cache-dependency-path: crates/botguard/js/pnpm-lock.yaml
+
+    - name: Install Rust
+      shell: bash
+      # Installs the version and components pinned in rust-toolchain.toml.
+      run: rustup toolchain install
+
+    # Caches downloaded crates and compiled dependencies. Also saved when a
+    # job fails (e.g. a failing test), so the compile work isn't lost. If a
+    # cache ever seems stuck half-built, bump `prefix-key` to start fresh.
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.cache-key }}
+        cache-on-failure: true

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Merged into Elizabeats.app's Info.plist by cargo-packager. -->
+<plist version="1.0">
+<dict>
+  <!-- The Icon Composer icon in Assets.car (scripts/compile-macos-icon.sh),
+       used on macOS 26+. Older macOS uses CFBundleIconFile (icon.icns). -->
+  <key>CFBundleIconName</key>
+  <string>icon</string>
+</dict>
+</plist>

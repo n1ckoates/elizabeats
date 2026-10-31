@@ -1,0 +1,11 @@
+{
+  "name": "elizabeats-botguard-js",
+  "private": true,
+  "description": "Source for the JS bundles embedded into the Rust crate (youtube.browser.js, bgutils.browser.js). build.rs runs build.mjs on every cargo build.",
+  "type": "module",
+  "devDependencies": {
+    "bgutils-js": "4.0.3",
+    "esbuild": "0.25.10",
+    "youtubei.js": "18.0.0"
+  }
+}

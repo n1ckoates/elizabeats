@@ -1,0 +1,22 @@
+[package]
+name = "elizabeats-library"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+elizabeats-core.workspace = true
+# Default features only add ID3v2 frame decompression via flate2, which the
+# workspace already builds for HTTP; lofty 0.25.4 also fails to compile without it.
+lofty = "0.25"
+# Filesystem watching; the default backend (FSEvents on macOS, inotify on Linux).
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+# Only `tokio::sync::watch`, so `rescan_and_wait` works on any async executor.
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

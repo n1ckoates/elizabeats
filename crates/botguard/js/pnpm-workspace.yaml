@@ -1,0 +1,4 @@
+# pnpm settings for this folder (pnpm 11+ reads them here, not from package.json).
+# esbuild runs an install script to fetch its native binary.
+allowBuilds:
+  esbuild: true
