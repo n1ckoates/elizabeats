@@ -1,11 +1,10 @@
-//! YouTube "proof of origin" (PO) tokens and audio stream URLs, both produced
-//! inside the operating system's webview (a real browser engine; YouTube
-//! rejects tokens minted anywhere else).
+//! YouTube audio stream URLs, resolved inside the operating system's webview
+//! (a real browser engine; YouTube rejects "proof of origin" (PO) tokens
+//! minted anywhere else).
 //!
-//! - [`BotguardService::mint`] mints PO tokens with bgutils-js.
-//! - [`BotguardService::resolve_audio_stream`] mints the token for a video ID
-//!   and runs youtubei.js (YouTube Music client) in the same page to get a
-//!   direct, deciphered AAC/MP4 audio URL.
+//! [`BotguardService::resolve_audio_stream`] has the page mint a PO token for
+//! a video ID with bgutils-js and run youtubei.js (YouTube Music client) to get
+//! a direct, deciphered AAC/MP4 audio URL.
 //!
 //! The webview runs in a helper process (this same executable), because a
 //! webview needs the main thread and its own event loop:
@@ -32,17 +31,18 @@ mod protocol;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 pub use helper::{HELPER_FLAG, helper_main_if_requested};
+pub use protocol::AudioStream;
 
-/// How long one mint request may take, including starting the helper and
-/// creating a fresh minter (normally 1-3 s cold, a few ms warm).
-pub const MINT_TIMEOUT: Duration = Duration::from_secs(25);
+/// How long a prewarm may take: starting the helper and creating a fresh
+/// minter (normally 1-3 s).
+const MINT_TIMEOUT: Duration = Duration::from_secs(25);
 /// How long resolving one audio stream may take, including starting the
 /// helper and minting the token (normally about 1-2 s cold, well under 1 s
 /// warm). The page gives up on its own a little earlier.
-pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(60);
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Subdirectory of the data directory the webview may use (WebView2 needs a
 /// writable folder; WKWebView and WebKitGTK run without persistent storage).
@@ -50,22 +50,12 @@ const WEBVIEW_DIR_NAME: &str = "webview-minter";
 
 #[derive(Debug, thiserror::Error)]
 pub enum BotguardError {
-    /// Kept for API compatibility; no longer returned.
-    #[error("BotGuard is not implemented yet")]
-    Unimplemented,
     #[error("{0}")]
     Other(String),
     #[error("PO token generation timed out")]
     Timeout,
     #[error("invalid PO token identifier: {0}")]
     InvalidIdentifier(String),
-    #[error("YouTube request failed: {0}")]
-    Network(String),
-    /// YouTube answered, but not with what we need (e.g. no integrity token).
-    #[error("YouTube rejected the BotGuard attestation: {0}")]
-    Rejected(String),
-    #[error("BotGuard JavaScript error: {0}")]
-    Js(String),
     #[error("I/O error: {0}")]
     Io(String),
     #[error("the BotGuard service is not running")]
@@ -82,40 +72,14 @@ impl From<std::io::Error> for BotguardError {
     }
 }
 
-/// PO tokens for the requested identifiers, in request order.
-#[derive(Clone, Debug)]
-pub struct MintedTokens {
-    pub tokens: Vec<String>,
-    pub valid_until: SystemTime,
-}
-
-/// A directly downloadable audio stream (always AAC in MP4).
-#[derive(Clone, Debug)]
-pub struct AudioStream {
-    pub url: String,
-    /// e.g. `audio/mp4; codecs="mp4a.40.2"`.
-    pub mime_type: String,
-    pub content_length: Option<u64>,
-    /// Bits per second.
-    pub bitrate: Option<u64>,
-    pub itag: u32,
-    /// The User-Agent the stream was requested with (also in `headers`).
-    pub user_agent: Option<String>,
-    /// Headers to send with the download GETs. Currently just the
-    /// User-Agent (the live tests show even that is optional). Download in
-    /// chunks of at most 10 MB using the `&range=start-end` URL parameter,
-    /// like YouTube's own player.
-    pub headers: Vec<(String, String)>,
-}
-
 /// How the webview helper process is started. [`BotguardService::start`]
 /// uses this executable; tests point it at a test binary or a fake.
 #[derive(Clone, Debug)]
 pub struct HelperOptions {
     pub program: PathBuf,
     pub args: Vec<OsString>,
-    /// Per-request limit for minting; an overdue helper is killed and
-    /// restarted.
+    /// Per-request limit for prewarming (a mint request); an overdue helper
+    /// is killed and restarted.
     pub mint_timeout: Duration,
     /// The same for resolving an audio stream.
     pub resolve_timeout: Duration,
@@ -141,7 +105,7 @@ impl HelperOptions {
 /// threads. The helper process stops when the last handle is dropped.
 #[derive(Clone, Debug)]
 pub struct BotguardService {
-    helper: Arc<client::HelperClient>,
+    client: Arc<client::HelperClient>,
 }
 
 impl BotguardService {
@@ -155,36 +119,10 @@ impl BotguardService {
     }
 
     /// Like [`BotguardService::start`] with a custom helper process.
-    pub fn start_with_helper(helper: HelperOptions) -> Result<Self, BotguardError> {
-        let client = client::HelperClient::start(client::Launch {
-            program: helper.program,
-            args: helper.args,
-            mint_timeout: helper.mint_timeout,
-            resolve_timeout: helper.resolve_timeout,
-        })?;
+    pub fn start_with_helper(options: HelperOptions) -> Result<Self, BotguardError> {
         Ok(Self {
-            helper: Arc::new(client),
+            client: Arc::new(client::HelperClient::start(options)?),
         })
-    }
-
-    /// Mints one PO token per identifier (video IDs or visitor data; visitor
-    /// data may be URL-encoded).
-    pub async fn mint(&self, identifiers: &[String]) -> Result<MintedTokens, BotguardError> {
-        protocol::validate_identifiers(identifiers)?;
-        let identifiers = identifiers
-            .iter()
-            .map(|identifier| protocol::percent_decode(identifier))
-            .collect();
-        let (reply, response) = tokio::sync::oneshot::channel();
-        self.helper.send(client::Job::Mint {
-            identifiers,
-            reply: Box::new(move |result| {
-                // The caller may have stopped waiting; nothing to do then.
-                let _ = reply.send(result);
-            }),
-        })?;
-        // The client always answers by the request's deadline.
-        response.await.map_err(|_| BotguardError::ServiceStopped)?
     }
 
     /// Resolves the best AAC/MP4 audio-only stream of a YouTube video. The
@@ -194,12 +132,11 @@ impl BotguardService {
             return Err(BotguardError::InvalidIdentifier(format!("{video_id:?}")));
         }
         let (reply, response) = tokio::sync::oneshot::channel();
-        self.helper.send(client::Job::Resolve {
+        self.client.send(client::Job::Resolve {
             video_id: video_id.to_owned(),
-            reply: Box::new(move |result| {
-                let _ = reply.send(result);
-            }),
+            reply,
         })?;
+        // The client always answers by the request's deadline.
         response.await.map_err(|_| BotguardError::ServiceStopped)?
     }
 
@@ -207,16 +144,16 @@ impl BotguardService {
     /// background so the first real request is fast. Failures are only
     /// logged; the next request retries.
     pub fn prewarm(&self) {
-        let sent = self.helper.send(client::Job::Mint {
-            identifiers: Vec::new(),
-            reply: Box::new(|result| {
-                if let Err(error) = result {
-                    tracing::warn!("could not prewarm the webview helper: {error}");
-                }
-            }),
-        });
-        if let Err(error) = sent {
+        if let Err(error) = self.client.send(client::Job::Prewarm) {
             tracing::warn!("could not prewarm BotGuard: {error}");
         }
     }
+}
+
+/// Starts a named background thread.
+fn spawn_thread(name: &str, run: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(run)
+        .map(drop)
 }

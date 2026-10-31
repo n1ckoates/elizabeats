@@ -28,39 +28,6 @@ fn start_service() -> (tempfile::TempDir, BotguardService) {
     (dir, service)
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs network access to YouTube and a system webview"]
-async fn mints_po_tokens_in_the_system_webview() {
-    let (_dir, service) = start_service();
-    let video = vec!["dQw4w9WgXcQ".to_owned()];
-    let both = vec![
-        "fa5IWHDbftI".to_owned(),
-        "CgtxRzl5bVZuQl8zcyjF25fWBjIKCgJVUxIEGgAgOw%3D%3D".to_owned(),
-    ];
-
-    let started = Instant::now();
-    let cold = service.mint(&video).await.unwrap();
-    let cold_time = started.elapsed();
-    let started = Instant::now();
-    let warm = service.mint(&video).await.unwrap();
-    let warm_time = started.elapsed();
-    let started = Instant::now();
-    let pair = service.mint(&both).await.unwrap();
-    let pair_time = started.elapsed();
-
-    println!("cold mint (spawn helper + webview + BotGuard): {cold_time:?}");
-    println!("warm mint: {warm_time:?}; warm mint of 2 identifiers: {pair_time:?}");
-    println!(
-        "token: {} (valid until {:?})",
-        cold.tokens[0], cold.valid_until
-    );
-    assert_eq!(cold.tokens.len(), 1);
-    assert_eq!(warm.tokens.len(), 1);
-    assert_eq!(pair.tokens.len(), 2);
-    assert!(cold.tokens[0].len() > 80);
-    assert!(cold.valid_until > std::time::SystemTime::now() + Duration::from_secs(600));
-}
-
 /// Drives the helper executable directly over its pipes.
 #[test]
 #[ignore = "needs network access to YouTube and a system webview"]
@@ -127,8 +94,8 @@ async fn download_fully(stream: &AudioStream) -> (u64, Duration) {
     while received < total {
         let end = (received + CHUNK).min(total) - 1;
         let mut request = client.get(format!("{}&range={received}-{end}", stream.url));
-        for (name, value) in &stream.headers {
-            request = request.header(name, value);
+        if let Some(user_agent) = &stream.user_agent {
+            request = request.header("User-Agent", user_agent);
         }
         let response = request.send().await.unwrap();
         let status = response.status();
@@ -160,7 +127,7 @@ async fn resolves_and_downloads_youtube_music_songs() {
         let stream = service.resolve_audio_stream(video_id).await.unwrap();
         let resolve_time = started.elapsed();
         println!(
-            "{video_id}: resolved in {resolve_time:?} ({}): itag {} {} {:?} bytes, {:?} bps, headers {:?}",
+            "{video_id}: resolved in {resolve_time:?} ({}): itag {} {} {:?} bytes, {:?} bps",
             if index == 0 {
                 "cold: helper + webview + minter + youtubei.js session"
             } else {
@@ -170,15 +137,10 @@ async fn resolves_and_downloads_youtube_music_songs() {
             stream.mime_type,
             stream.content_length,
             stream.bitrate,
-            stream.headers,
         );
         assert!(stream.mime_type.starts_with("audio/mp4"));
         let user_agent = stream.user_agent.as_deref().unwrap();
         assert!(user_agent.contains("AppleWebKit"), "{user_agent}");
-        assert_eq!(
-            stream.headers,
-            vec![("User-Agent".to_owned(), user_agent.to_owned())]
-        );
         // Not even the User-Agent is required (checked on the first MB).
         let bare = reqwest::Client::new()
             .get(format!("{}&range=0-1048575", stream.url))

@@ -1,5 +1,5 @@
 //! App side of the webview helper: starts the helper process on first use,
-//! sends mint and resolve requests to its stdin, matches the replies on its
+//! sends prewarm and resolve requests to its stdin, matches the replies on its
 //! stdout, enforces timeouts and replaces the helper when it crashes or hangs.
 //!
 //! All of this runs on one plain thread (the "manager") that never blocks on
@@ -8,42 +8,33 @@
 //! oneshot channel, so the app's async runtime is never blocked.
 
 use std::collections::HashMap;
-use std::ffi::OsString;
-use std::io::{BufReader, Write};
-use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::io::Write;
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+use tokio::sync::oneshot;
+
 use crate::protocol::{
-    HelperReply, HelperRequest, RequestAction, decode_line, encode_line, read_bounded_line,
+    AudioStream, HelperReply, HelperRequest, RequestAction, decode_line, encode_line, for_each_line,
 };
-use crate::{AudioStream, BotguardError, MintedTokens};
+use crate::{BotguardError, HelperOptions, spawn_thread};
 
-/// Called exactly once with the outcome of a mint request.
-pub(crate) type MintReply = Box<dyn FnOnce(Result<MintedTokens, BotguardError>) + Send>;
-/// Called exactly once with the outcome of a resolve request.
-pub(crate) type StreamReply = Box<dyn FnOnce(Result<AudioStream, BotguardError>) + Send>;
-
-/// One request for the helper, with the callback for its answer.
+/// One request for the helper.
 pub(crate) enum Job {
-    /// `identifiers` go to BotGuard as they are; an empty list only makes
-    /// sure the helper is ready (prewarm).
-    Mint {
-        identifiers: Vec<String>,
-        reply: MintReply,
-    },
+    /// Makes sure the helper is ready (an empty mint); failures are logged.
+    Prewarm,
     Resolve {
         video_id: String,
-        reply: StreamReply,
+        reply: oneshot::Sender<Result<AudioStream, BotguardError>>,
     },
 }
 
 impl Job {
     fn action(&self) -> RequestAction {
         match self {
-            Job::Mint { identifiers, .. } => RequestAction::Mint {
-                identifiers: identifiers.clone(),
+            Job::Prewarm => RequestAction::Mint {
+                identifiers: Vec::new(),
             },
             Job::Resolve { video_id, .. } => RequestAction::Resolve {
                 resolve: video_id.clone(),
@@ -51,38 +42,20 @@ impl Job {
         }
     }
 
-    fn answer(self, reply: HelperReply) {
+    /// Delivers the outcome; called exactly once per job.
+    fn finish(self, reply: Result<HelperReply, BotguardError>) {
         match self {
-            Job::Mint {
-                identifiers,
-                reply: callback,
-            } => {
-                callback(reply.into_tokens(identifiers.len()));
+            Job::Prewarm => {
+                if let Err(error) = reply.and_then(HelperReply::into_prewarmed) {
+                    tracing::warn!("could not prewarm the webview helper: {error}");
+                }
             }
-            Job::Resolve {
-                reply: callback, ..
-            } => callback(reply.into_stream()),
+            Job::Resolve { reply: sender, .. } => {
+                // The caller may have stopped waiting; nothing to do then.
+                let _ = sender.send(reply.and_then(HelperReply::into_stream));
+            }
         }
     }
-
-    fn fail(self, error: BotguardError) {
-        match self {
-            Job::Mint { reply, .. } => reply(Err(error)),
-            Job::Resolve { reply, .. } => reply(Err(error)),
-        }
-    }
-}
-
-/// How to start the helper process. Public (via `HelperOptions`) so tests
-/// can point it at a test binary or a fake.
-#[derive(Clone, Debug)]
-pub(crate) struct Launch {
-    pub program: PathBuf,
-    pub args: Vec<OsString>,
-    /// How long one mint request may take, including starting the helper.
-    pub mint_timeout: Duration,
-    /// The same for one resolve request.
-    pub resolve_timeout: Duration,
 }
 
 enum Event {
@@ -106,22 +79,20 @@ pub(crate) struct HelperClient {
 }
 
 impl HelperClient {
-    pub fn start(launch: Launch) -> Result<Self, BotguardError> {
+    pub fn start(options: HelperOptions) -> Result<Self, BotguardError> {
         let (events, receiver) = mpsc::channel();
         let mut manager = Manager {
-            launch,
+            options,
             events: events.clone(),
             helper: None,
             next_id: 1,
             next_generation: 1,
         };
-        std::thread::Builder::new()
-            .name("webview-minter".into())
-            .spawn(move || manager.run(&receiver))?;
+        spawn_thread("webview-minter", move || manager.run(&receiver))?;
         Ok(Self { events })
     }
 
-    /// Queues a request; its callback is always called, by its deadline.
+    /// Queues a request; it is always finished, by its deadline.
     pub fn send(&self, job: Job) -> Result<(), BotguardError> {
         self.events
             .send(Event::Request(job))
@@ -149,8 +120,26 @@ struct Helper {
     pending: HashMap<u64, Pending>,
 }
 
+/// Why a helper is being stopped; decides what its pending requests get.
+#[derive(Clone, Copy)]
+enum Stop {
+    Timeout,
+    Failed(&'static str),
+    Shutdown,
+}
+
+impl Stop {
+    fn error(self) -> BotguardError {
+        match self {
+            Stop::Timeout => BotguardError::Timeout,
+            Stop::Failed(message) => BotguardError::Other(message.to_owned()),
+            Stop::Shutdown => BotguardError::ServiceStopped,
+        }
+    }
+}
+
 struct Manager {
-    launch: Launch,
+    options: HelperOptions,
     /// Given to the pipe threads so they can report back.
     events: mpsc::Sender<Event>,
     helper: Option<Helper>,
@@ -170,14 +159,26 @@ impl Manager {
             match event {
                 Ok(Event::Request(job)) => self.request(job),
                 Ok(Event::Line { generation, line }) => self.on_line(generation, &line),
-                Ok(Event::Exited { generation }) => self.on_exit(generation),
+                Ok(Event::Exited { generation }) => {
+                    if self.is_current(generation) {
+                        tracing::warn!(
+                            "the webview minter exited; it will be restarted on the next request"
+                        );
+                        self.stop(Stop::Failed("the webview minter exited unexpectedly"));
+                    }
+                }
                 Ok(Event::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
                     self.stop(Stop::Shutdown);
                     return;
                 }
                 Err(RecvTimeoutError::Timeout) => {}
             }
-            self.expire_overdue();
+            // An overdue request means the helper hangs, so it is killed; the
+            // next request starts a fresh one.
+            if self.next_deadline().is_some_and(|d| d <= Instant::now()) {
+                tracing::warn!("the webview minter did not answer in time; restarting it");
+                self.stop(Stop::Timeout);
+            }
         }
     }
 
@@ -187,9 +188,9 @@ impl Manager {
                 Ok(helper) => self.helper = Some(helper),
                 Err(error) => {
                     tracing::warn!("could not start the webview helper: {error}");
-                    job.fail(BotguardError::Other(format!(
+                    job.finish(Err(BotguardError::Other(format!(
                         "could not start the webview minter: {error}"
-                    )));
+                    ))));
                     return;
                 }
             }
@@ -204,22 +205,14 @@ impl Manager {
             action: job.action(),
         }) {
             Ok(line) => line,
-            Err(error) => {
-                job.fail(error);
-                return;
-            }
+            Err(error) => return job.finish(Err(error)),
         };
         let timeout = match job {
-            Job::Mint { .. } => self.launch.mint_timeout,
-            Job::Resolve { .. } => self.launch.resolve_timeout,
+            Job::Prewarm => self.options.mint_timeout,
+            Job::Resolve { .. } => self.options.resolve_timeout,
         };
-        helper.pending.insert(
-            id,
-            Pending {
-                deadline: Instant::now() + timeout,
-                job,
-            },
-        );
+        let deadline = Instant::now() + timeout;
+        helper.pending.insert(id, Pending { deadline, job });
         if helper.stdin.send(line).is_err() {
             // The writer thread is gone, so the helper is unusable.
             self.stop(Stop::Failed(
@@ -237,33 +230,14 @@ impl Manager {
             return;
         };
         if let Some(pending) = helper.pending.remove(&reply.id) {
-            pending.job.answer(reply);
+            pending.job.finish(Ok(reply));
         }
     }
 
-    fn on_exit(&mut self, generation: u64) {
-        if self
-            .helper
+    fn is_current(&self, generation: u64) -> bool {
+        self.helper
             .as_ref()
             .is_some_and(|h| h.generation == generation)
-        {
-            tracing::warn!("the webview minter exited; it will be restarted on the next request");
-            self.stop(Stop::Failed("the webview minter exited unexpectedly"));
-        }
-    }
-
-    /// Fails overdue requests. An overdue request means the helper hangs, so
-    /// it is killed; the next request starts a fresh one.
-    fn expire_overdue(&mut self) {
-        let now = Instant::now();
-        let overdue = self
-            .helper
-            .as_ref()
-            .is_some_and(|h| h.pending.values().any(|p| p.deadline <= now));
-        if overdue {
-            tracing::warn!("the webview minter did not answer in time; restarting it");
-            self.stop(Stop::Timeout);
-        }
     }
 
     fn next_deadline(&self) -> Option<Instant> {
@@ -277,31 +251,21 @@ impl Manager {
         let Some(helper) = self.helper.take() else {
             return;
         };
-        let Helper {
-            child,
-            stdin,
-            pending,
-            ..
-        } = helper;
-        for (_, request) in pending {
-            request.job.fail(match reason {
-                Stop::Timeout => BotguardError::Timeout,
-                Stop::Failed(message) => BotguardError::Other(message.to_owned()),
-                Stop::Shutdown => BotguardError::ServiceStopped,
-            });
+        for (_, pending) in helper.pending {
+            pending.job.finish(Err(reason.error()));
         }
         // Closing stdin asks the helper to exit by itself.
-        drop(stdin);
-        retire(child, matches!(reason, Stop::Shutdown));
+        drop(helper.stdin);
+        retire(helper.child, matches!(reason, Stop::Shutdown));
     }
 
     fn spawn(&mut self) -> std::io::Result<Helper> {
         let generation = self.next_generation;
         self.next_generation += 1;
 
-        let mut command = Command::new(&self.launch.program);
+        let mut command = Command::new(&self.options.program);
         command
-            .args(&self.launch.args)
+            .args(&self.options.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -321,14 +285,41 @@ impl Manager {
         );
 
         let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
-        let (Some(stdin), Some(stdout), Some(stderr)) = pipes else {
+        let (Some(mut stdin), Some(stdout), Some(stderr)) = pipes else {
             retire(child, false);
             return Err(std::io::Error::other("helper pipes missing"));
         };
-        let (lines, queue) = mpsc::channel();
-        let threads = spawn_writer(stdin, queue)
-            .and_then(|()| spawn_reader(stdout, generation, self.events.clone()))
-            .and_then(|()| spawn_log_forwarder(stderr));
+        let (lines, queue) = mpsc::channel::<Vec<u8>>();
+        let events = self.events.clone();
+        let threads = spawn_thread("webview-minter-stdin", move || {
+            for line in queue {
+                if stdin.write_all(&line).and_then(|()| stdin.flush()).is_err() {
+                    // The helper is gone; the stdout reader reports that.
+                    return;
+                }
+            }
+        })
+        .and_then(|()| {
+            spawn_thread("webview-minter-stdout", move || {
+                for_each_line(stdout, |line| {
+                    let line = line.to_owned();
+                    events.send(Event::Line { generation, line }).is_ok()
+                });
+                let _ = events.send(Event::Exited { generation });
+            })
+        })
+        .and_then(|()| {
+            // Copies the helper's stderr (its diagnostics) into our log.
+            spawn_thread("webview-minter-stderr", move || {
+                for_each_line(stderr, |line| {
+                    let text = line.trim_end();
+                    if !text.is_empty() {
+                        tracing::info!(target: "elizabeats_botguard::helper", "{text:.500}");
+                    }
+                    true
+                });
+            })
+        });
         if let Err(error) = threads {
             retire(child, false);
             return Err(error);
@@ -340,13 +331,6 @@ impl Manager {
             pending: HashMap::new(),
         })
     }
-}
-
-#[derive(Clone, Copy)]
-enum Stop {
-    Timeout,
-    Failed(&'static str),
-    Shutdown,
 }
 
 /// Makes sure a helper process ends and is reaped, without blocking the
@@ -365,71 +349,7 @@ fn retire(mut child: Child, graceful: bool) {
         let _ = child.kill();
         let _ = child.wait();
     };
-    if std::thread::Builder::new()
-        .name("webview-minter-reaper".into())
-        .spawn(reap)
-        .is_err()
-    {
+    if spawn_thread("webview-minter-reaper", reap).is_err() {
         tracing::warn!("could not reap the webview minter process");
     }
-}
-
-fn spawn_writer(mut stdin: ChildStdin, queue: mpsc::Receiver<Vec<u8>>) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name("webview-minter-stdin".into())
-        .spawn(move || {
-            for line in queue {
-                if stdin.write_all(&line).and_then(|()| stdin.flush()).is_err() {
-                    // The helper is gone; the stdout reader reports that.
-                    return;
-                }
-            }
-        })
-        .map(drop)
-}
-
-fn spawn_reader(
-    stdout: std::process::ChildStdout,
-    generation: u64,
-    events: mpsc::Sender<Event>,
-) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name("webview-minter-stdout".into())
-        .spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            let mut line = Vec::new();
-            loop {
-                line.clear();
-                match read_bounded_line(&mut reader, &mut line) {
-                    Ok(true) => {
-                        let line = String::from_utf8_lossy(&line).into_owned();
-                        if events.send(Event::Line { generation, line }).is_err() {
-                            return;
-                        }
-                    }
-                    Ok(false) | Err(_) => break,
-                }
-            }
-            let _ = events.send(Event::Exited { generation });
-        })
-        .map(drop)
-}
-
-/// Copies the helper's stderr (its diagnostics) into our log.
-fn spawn_log_forwarder(stderr: std::process::ChildStderr) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name("webview-minter-stderr".into())
-        .spawn(move || {
-            let mut reader = BufReader::new(stderr);
-            let mut line = Vec::new();
-            while let Ok(true) = read_bounded_line(&mut reader, &mut line) {
-                let text = String::from_utf8_lossy(&line);
-                let text = text.trim_end();
-                if !text.is_empty() {
-                    tracing::info!(target: "elizabeats_botguard::helper", "{text:.500}");
-                }
-                line.clear();
-            }
-        })
-        .map(drop)
 }
