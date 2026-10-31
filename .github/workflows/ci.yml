@@ -49,17 +49,37 @@ jobs:
 
   package:
     name: Package (${{ matrix.name }})
-    needs: [format, check]
     strategy:
       fail-fast: false
       matrix:
         include:
           # The Intel build is cross-built on the Apple Silicon runner.
-          - { name: macOS Apple Silicon, os: macos-latest, formats: "app,dmg", files: "target/packages/*.dmg" }
-          - { name: macOS Intel, os: macos-latest, target: x86_64-apple-darwin, formats: "app,dmg", files: "target/packages/*.dmg" }
-          - { name: Windows, os: windows-latest, formats: nsis, files: "target/packages/*-setup.exe" }
+          - {
+              name: macOS Apple Silicon,
+              os: macos-latest,
+              formats: "app,dmg",
+              files: "target/packages/*.dmg",
+            }
+          - {
+              name: macOS Intel,
+              os: macos-latest,
+              target: x86_64-apple-darwin,
+              formats: "app,dmg",
+              files: "target/packages/*.dmg",
+            }
+          - {
+              name: Windows,
+              os: windows-latest,
+              formats: nsis,
+              files: "target/packages/*-setup.exe",
+            }
           # The oldest supported Ubuntu, so the .deb runs on it and newer.
-          - { name: Linux, os: ubuntu-22.04, formats: deb, files: "target/packages/*.deb" }
+          - {
+              name: Linux,
+              os: ubuntu-22.04,
+              formats: deb,
+              files: "target/packages/*.deb",
+            }
     runs-on: ${{ matrix.os }}
     env:
       # Set only for a cross build (the steps add `--target` when it is).
