@@ -121,8 +121,7 @@ fn handle_other(dir: &std::path::Path, job: Job, on_error: &dyn Fn(String)) {
             }
         }
         Job::SavePlayLog(entry) => {
-            if let Err(error) = elizabeats_store::append_play_log(dir, std::slice::from_ref(&entry))
-            {
+            if let Err(error) = elizabeats_store::append_play_log(dir, &entry) {
                 on_error(format!("Play log could not be saved: {error}"));
             }
         }

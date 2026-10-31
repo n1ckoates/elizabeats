@@ -128,7 +128,7 @@ impl Station {
             }
             _ => Vec::new(),
         };
-        session.recovery_loaded(recovery.map_err(|error| strip_prefix(&error)));
+        session.recovery_loaded(recovery);
         session.play_log_loaded(
             elizabeats_store::read_play_log(&services.data_dir).map_err(|error| error.to_string()),
         );
@@ -453,12 +453,4 @@ fn spawn_cache_worker(services: &Arc<Services>) -> tokio::sync::mpsc::UnboundedS
         }
     });
     sender
-}
-
-/// The store prefixes recovery errors; the Session adds its own prefix.
-fn strip_prefix(message: &str) -> String {
-    message
-        .strip_prefix("Queue recovery could not be read: ")
-        .unwrap_or(message)
-        .to_owned()
 }

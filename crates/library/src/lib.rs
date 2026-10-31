@@ -5,12 +5,11 @@
 //! All slow work (walking folders, reading tags, watching) happens on one
 //! background "library" thread. Methods on [`LocalLibrary`] only read the
 //! latest published index, so they are cheap and never wait for a scan —
-//! except [`LocalLibrary::artwork`], which may read one file.
+//! except [`LocalLibrary::artwork`], which reads one file.
 
 // Tests may panic on failure; production code may not.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-mod artwork;
 mod scan;
 
 use std::collections::HashMap;
@@ -22,17 +21,12 @@ use std::time::{Duration, Instant};
 use elizabeats_core::{DiagnosticEvent, DiagnosticSink, SourceId, Track};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
-pub use artwork::Artwork;
-
-use artwork::{ArtworkCache, read_artwork};
-
 /// Quiet period after the last filesystem change before rescanning.
 const RESCAN_DEBOUNCE: Duration = Duration::from_millis(250);
 /// A steady stream of changes (e.g. a long copy) still rescans this often.
 const RESCAN_MAX_DELAY: Duration = Duration::from_secs(3);
 /// How often a missing Library folder is checked for again.
 const UNAVAILABLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
-const ARTWORK_CACHE_ENTRIES: usize = 200;
 
 const TRACK_UNAVAILABLE: &str = "This local track is no longer available.";
 
@@ -49,60 +43,42 @@ struct Shared {
     /// they have been superseded without taking the lock.
     folder_generation: AtomicU64,
     shutdown: AtomicBool,
-    /// The newest rescan request that has been fully handled.
+    /// The newest rescan request that has been fully handled; `u64::MAX`
+    /// once the library thread is gone, which releases every waiter.
     completed: tokio::sync::watch::Sender<u64>,
-    artwork: Mutex<ArtworkState>,
     on_changed: Arc<dyn Fn() + Send + Sync>,
     diagnostics: DiagnosticSink,
 }
 
 struct State {
     folder: Option<PathBuf>,
-    index: Index,
+    /// The Tracks, or why the folder can't be scanned (then `files` is empty).
+    tracks: Result<Arc<Vec<Track>>, String>,
+    /// Track id → absolute path. The only way ids are turned into paths.
+    files: Arc<HashMap<String, PathBuf>>,
     /// Rescan request counter; the library thread catches up to it.
     requested: u64,
     /// Pending watcher-triggered rescan: (first event, latest event).
     pending_change: Option<(Instant, Instant)>,
     /// The watcher reported an error and should be recreated.
     watcher_failed: bool,
-    /// The last scan found the folder missing (or not a folder).
-    unavailable: bool,
-    scanning: bool,
-    worker_running: bool,
 }
 
-#[derive(Clone)]
-struct Index {
-    tracks: Result<Arc<Vec<Track>>, String>,
-    /// Track id → absolute path. The only way ids are turned into paths.
-    files: Arc<HashMap<String, PathBuf>>,
-}
-
-impl Index {
-    fn empty() -> Self {
-        Self {
-            tracks: Ok(Arc::new(Vec::new())),
-            files: Arc::new(HashMap::new()),
-        }
+impl State {
+    fn set_index(&mut self, tracks: Result<Vec<Track>, String>, files: HashMap<String, PathBuf>) {
+        self.tracks = tracks.map(Arc::new);
+        self.files = Arc::new(files);
     }
-
-    fn unavailable(error: String) -> Self {
-        Self {
-            tracks: Err(error),
-            files: Arc::new(HashMap::new()),
-        }
-    }
-}
-
-struct ArtworkState {
-    cache: ArtworkCache,
-    /// Bumped when the index changes, so a slow read cannot cache stale art.
-    generation: u64,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     // A panic elsewhere must not take the Library down with it.
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// When a pending change (first event, latest event) should be rescanned.
+fn change_due((first, latest): (Instant, Instant)) -> Instant {
+    (latest + RESCAN_DEBOUNCE).min(first + RESCAN_MAX_DELAY)
 }
 
 impl LocalLibrary {
@@ -113,22 +89,16 @@ impl LocalLibrary {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 folder: None,
-                index: Index::empty(),
+                tracks: Ok(Arc::default()),
+                files: Arc::default(),
                 requested: 0,
                 pending_change: None,
                 watcher_failed: false,
-                unavailable: false,
-                scanning: false,
-                worker_running: true,
             }),
             wake: Condvar::new(),
             folder_generation: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             completed,
-            artwork: Mutex::new(ArtworkState {
-                cache: ArtworkCache::new(ARTWORK_CACHE_ENTRIES),
-                generation: 0,
-            }),
             on_changed,
             diagnostics,
         });
@@ -137,7 +107,7 @@ impl LocalLibrary {
             .name("library".into())
             .spawn(move || run_worker(worker_shared));
         if let Err(error) = spawned {
-            lock(&shared.state).worker_running = false;
+            shared.completed.send_replace(u64::MAX);
             shared.record(
                 "start",
                 Some(format!("Could not start the library thread: {error}")),
@@ -156,46 +126,32 @@ impl LocalLibrary {
             let mut state = lock(&self.shared.state);
             self.shared.folder_generation.fetch_add(1, Ordering::SeqCst);
             state.folder = folder;
-            state.index = Index::empty();
+            state.set_index(Ok(Vec::new()), HashMap::new());
             state.pending_change = None;
-            state.unavailable = false;
             state.requested += 1;
         }
-        self.shared.clear_artwork();
         self.shared.wake.notify_all();
         (self.shared.on_changed)();
-    }
-
-    /// The current Library folder, if any.
-    pub fn library_folder(&self) -> Option<PathBuf> {
-        lock(&self.shared.state).folder.clone()
-    }
-
-    /// Starts a background rescan; `on_changed` fires when it finishes.
-    pub fn rescan(&self) {
-        self.request_rescan();
     }
 
     /// Rescans and waits until a scan that started after this call has
     /// finished. Works with any async executor.
     pub async fn rescan_and_wait(&self) {
-        let Some(request) = self.request_rescan() else {
-            return;
+        let request = {
+            let mut state = lock(&self.shared.state);
+            state.requested += 1;
+            state.requested
         };
+        self.shared.wake.notify_all();
         let mut completed = self.shared.completed.subscribe();
         // An error only means the library thread has stopped.
         let _ = completed.wait_for(|done| *done >= request).await;
     }
 
-    /// True while a scan is in progress.
-    pub fn is_scanning(&self) -> bool {
-        lock(&self.shared.state).scanning
-    }
-
     /// The indexed Tracks, sorted by title, artist, then id. Fails when the
     /// Library folder is missing or not a folder.
-    pub fn tracks(&self) -> Result<Arc<Vec<Track>>, String> {
-        lock(&self.shared.state).index.tracks.clone()
+    fn tracks(&self) -> Result<Arc<Vec<Track>>, String> {
+        lock(&self.shared.state).tracks.clone()
     }
 
     /// Case-insensitive substring search over "title artist album". An empty
@@ -203,19 +159,14 @@ impl LocalLibrary {
     pub fn search(&self, query: &str) -> Result<Vec<Track>, String> {
         let tracks = self.tracks()?;
         let query = query.trim().to_lowercase();
-        if query.is_empty() {
-            return Ok(tracks.as_ref().clone());
-        }
         Ok(tracks
             .iter()
             .filter(|track| {
-                let haystack = format!(
-                    "{} {} {}",
-                    track.title,
-                    track.artist,
-                    track.album.as_deref().unwrap_or_default()
-                );
-                haystack.to_lowercase().contains(&query)
+                query.is_empty() || {
+                    let album = track.album.as_deref().unwrap_or_default();
+                    let haystack = format!("{} {} {album}", track.title, track.artist);
+                    haystack.to_lowercase().contains(&query)
+                }
             })
             .cloned()
             .collect())
@@ -236,39 +187,14 @@ impl LocalLibrary {
 
     /// Where Track `id` lives on disk (for "Reveal in Finder").
     pub fn path_of(&self, id: &str) -> Option<PathBuf> {
-        lock(&self.shared.state).index.files.get(id).cloned()
+        lock(&self.shared.state).files.get(id).cloned()
     }
 
-    /// Embedded cover art for Track `id`. May read the file on a cache miss,
-    /// so call it off the UI thread.
-    pub fn artwork(&self, id: &str) -> Option<Arc<Artwork>> {
-        let generation = {
-            let mut artwork = lock(&self.shared.artwork);
-            if let Some(cached) = artwork.cache.get(id) {
-                return cached;
-            }
-            artwork.generation
-        };
-        let path = self.path_of(id)?;
-        let art = read_artwork(&path).map(Arc::new);
-        let mut artwork = lock(&self.shared.artwork);
-        if artwork.generation == generation {
-            artwork.cache.insert(id.to_owned(), art.clone());
-        }
-        art
-    }
-
-    fn request_rescan(&self) -> Option<u64> {
-        let request = {
-            let mut state = lock(&self.shared.state);
-            if !state.worker_running {
-                return None;
-            }
-            state.requested += 1;
-            state.requested
-        };
-        self.shared.wake.notify_all();
-        Some(request)
+    /// Embedded cover art (encoded image bytes) for Track `id`: the front
+    /// cover, else the first picture. Reads the file, so call it off the UI
+    /// thread; callers cache the result.
+    pub fn artwork(&self, id: &str) -> Option<Vec<u8>> {
+        scan::read_artwork(&self.path_of(id)?)
     }
 }
 
@@ -288,12 +214,6 @@ impl Shared {
         (self.diagnostics)(event);
     }
 
-    fn clear_artwork(&self) {
-        let mut artwork = lock(&self.artwork);
-        artwork.generation += 1;
-        artwork.cache.clear();
-    }
-
     /// Called from the watcher thread for every filesystem change.
     fn note_change(&self, generation: u64) {
         if self.folder_generation.load(Ordering::SeqCst) != generation {
@@ -306,6 +226,25 @@ impl Shared {
             state.pending_change = Some((first, now));
         }
         self.wake.notify_all();
+    }
+
+    /// Replaces the index unless the folder changed meanwhile. Returns whether
+    /// it was published.
+    fn publish(
+        &self,
+        generation: u64,
+        tracks: Result<Vec<Track>, String>,
+        files: HashMap<String, PathBuf>,
+    ) -> bool {
+        {
+            let mut state = lock(&self.state);
+            if self.folder_generation.load(Ordering::SeqCst) != generation {
+                return false;
+            }
+            state.set_index(tracks, files);
+        }
+        (self.on_changed)();
+        true
     }
 }
 
@@ -321,7 +260,6 @@ struct WorkerExit<'a>(&'a Shared);
 
 impl Drop for WorkerExit<'_> {
     fn drop(&mut self) {
-        lock(&self.0.state).worker_running = false;
         self.0.completed.send_replace(u64::MAX);
     }
 }
@@ -373,24 +311,20 @@ fn next_work(shared: &Shared, handled: u64, last_folder_check: &mut Instant) -> 
             return Work::Stop;
         }
         let now = Instant::now();
-        if let Some((first, latest)) = state.pending_change {
-            let due = (latest + RESCAN_DEBOUNCE).min(first + RESCAN_MAX_DELAY);
-            if now >= due {
-                state.pending_change = None;
-                state.requested += 1;
-            }
+        if state
+            .pending_change
+            .is_some_and(|change| now >= change_due(change))
+        {
+            state.pending_change = None;
+            state.requested += 1;
         }
         if state.requested > handled {
             return Work::Scan {
                 request: state.requested,
             };
         }
-        let mut timeout: Option<Duration> = state.pending_change.map(|(first, latest)| {
-            (latest + RESCAN_DEBOUNCE)
-                .min(first + RESCAN_MAX_DELAY)
-                .saturating_duration_since(now)
-        });
-        if state.unavailable
+        let mut wake_at = state.pending_change.map(change_due);
+        if state.tracks.is_err()
             && let Some(folder) = &state.folder
         {
             let next_check = *last_folder_check + UNAVAILABLE_POLL_INTERVAL;
@@ -398,14 +332,13 @@ fn next_work(shared: &Shared, handled: u64, last_folder_check: &mut Instant) -> 
                 *last_folder_check = now;
                 return Work::CheckFolder(folder.clone());
             }
-            let until_check = next_check.saturating_duration_since(now);
-            timeout = Some(timeout.map_or(until_check, |t| t.min(until_check)));
+            wake_at = Some(wake_at.map_or(next_check, |at| at.min(next_check)));
         }
-        state = match timeout {
-            Some(timeout) => {
+        state = match wake_at {
+            Some(at) => {
                 shared
                     .wake
-                    .wait_timeout(state, timeout)
+                    .wait_timeout(state, at.saturating_duration_since(now))
                     .unwrap_or_else(PoisonError::into_inner)
                     .0
             }
@@ -420,44 +353,32 @@ fn next_work(shared: &Shared, handled: u64, last_folder_check: &mut Instant) -> 
 fn run_scan(shared: &Arc<Shared>, watcher: &mut Option<ActiveWatcher>) {
     let (folder, generation, watcher_failed) = {
         let mut state = lock(&shared.state);
-        state.scanning = true;
         state.pending_change = None;
-        let failed = std::mem::take(&mut state.watcher_failed);
         (
             state.folder.clone(),
             shared.folder_generation.load(Ordering::SeqCst),
-            failed,
+            std::mem::take(&mut state.watcher_failed),
         )
     };
+    // Dropped outside the lock: the watcher's callback may be waiting for it.
     if watcher_failed {
         *watcher = None;
     }
-    let superseded = || {
-        shared.folder_generation.load(Ordering::SeqCst) != generation
-            || shared.shutdown.load(Ordering::SeqCst)
-    };
-
     let Some(folder) = folder else {
         *watcher = None;
-        lock(&shared.state).scanning = false;
         return;
     };
 
     let problem = match std::fs::metadata(&folder) {
-        Err(_) => Some((
-            format!("Library folder is unavailable: {}", folder.display()),
-            "Library folder is unavailable.",
-        )),
-        Ok(meta) if !meta.is_dir() => Some((
-            format!("Library folder is not a folder: {}", folder.display()),
-            "Library folder is not a folder.",
-        )),
+        Err(_) => Some("Library folder is unavailable"),
+        Ok(meta) if !meta.is_dir() => Some("Library folder is not a folder"),
         Ok(_) => None,
     };
-    if let Some((error, diagnostic)) = problem {
+    if let Some(message) = problem {
         *watcher = None;
-        shared.record("rescan", Some(diagnostic.to_owned()));
-        publish(shared, generation, Index::unavailable(error), true);
+        shared.record("rescan", Some(format!("{message}.")));
+        let error = format!("{message}: {}", folder.display());
+        shared.publish(generation, Err(error), HashMap::new());
         return;
     }
 
@@ -473,34 +394,15 @@ fn run_scan(shared: &Arc<Shared>, watcher: &mut Option<ActiveWatcher>) {
         }
     }
 
-    let Some(result) = scan::scan(&folder, &superseded) else {
-        lock(&shared.state).scanning = false;
-        return;
+    let superseded = || {
+        shared.folder_generation.load(Ordering::SeqCst) != generation
+            || shared.shutdown.load(Ordering::SeqCst)
     };
-    let index = Index {
-        tracks: Ok(Arc::new(result.tracks)),
-        files: Arc::new(result.files),
-    };
-    if publish(shared, generation, index, false) {
+    if let Some((tracks, files)) = scan::scan(&folder, &superseded)
+        && shared.publish(generation, Ok(tracks), files)
+    {
         shared.record("rescan", None);
     }
-}
-
-/// Replaces the index unless the folder changed meanwhile. Returns whether
-/// it was published.
-fn publish(shared: &Shared, generation: u64, index: Index, unavailable: bool) -> bool {
-    {
-        let mut state = lock(&shared.state);
-        state.scanning = false;
-        if shared.folder_generation.load(Ordering::SeqCst) != generation {
-            return false;
-        }
-        state.index = index;
-        state.unavailable = unavailable;
-    }
-    shared.clear_artwork();
-    (shared.on_changed)();
-    true
 }
 
 fn start_watcher(

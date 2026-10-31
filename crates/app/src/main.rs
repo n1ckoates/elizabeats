@@ -119,8 +119,7 @@ pub fn bootstrap(launch: Launch) -> Result<StationParts, String> {
     };
     elizabeats_store::remove_stale_temp_files(&data_dir);
 
-    let diagnostics =
-        elizabeats_store::DiagnosticsStore::new(data_dir.join(elizabeats_store::DIAGNOSTICS_FILE));
+    let diagnostics = elizabeats_store::DiagnosticsStore::new(&data_dir);
     let sink = diagnostics.sink();
     let (events, receiver) = station::event_channel();
 

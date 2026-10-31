@@ -1,21 +1,27 @@
 //! `settings.json`: user Settings, read leniently.
 
-use std::io;
 use std::path::Path;
 
-use elizabeats_core::{AppSettings, Theme};
+use elizabeats_core::AppSettings;
 use serde_json::Value;
 
-use crate::{StoreError, write_atomic};
+use crate::StoreError;
+use crate::files::{read_optional, write_atomic};
 
-pub const SETTINGS_FILE: &str = "settings.json";
+const FILE: &str = "settings.json";
 
 /// Reads Settings from `dir`. Never fails: anything unreadable falls back to
 /// defaults.
 pub fn load_settings(dir: &Path) -> AppSettings {
-    match read_json(&dir.join(SETTINGS_FILE)) {
-        Ok(Some(value)) => normalize_settings(&value),
+    match read_optional(dir, FILE) {
         Ok(None) => AppSettings::default(),
+        Ok(Some(bytes)) => match serde_json::from_slice(&bytes) {
+            Ok(value) => normalize_settings(&value),
+            Err(error) => {
+                tracing::warn!("Using default settings: Settings could not be read: {error}");
+                AppSettings::default()
+            }
+        },
         Err(error) => {
             tracing::warn!("Using default settings: {error}");
             AppSettings::default()
@@ -24,32 +30,14 @@ pub fn load_settings(dir: &Path) -> AppSettings {
 }
 
 pub fn save_settings(dir: &Path, settings: &AppSettings) -> Result<(), StoreError> {
-    let mut json = serde_json::to_string_pretty(settings).map_err(|source| StoreError::Encode {
-        what: "Settings",
-        source,
-    })?;
-    json.push('\n');
-    write_atomic(&dir.join(SETTINGS_FILE), json.as_bytes())
-}
-
-/// `Ok(None)` when the file does not exist.
-fn read_json(path: &Path) -> Result<Option<Value>, StoreError> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(StoreError::io("read", path, source)),
-    };
-    serde_json::from_str(&text)
-        .map(Some)
-        .map_err(|error| StoreError::Invalid {
-            what: "Settings",
-            detail: error.to_string(),
-        })
+    let mut json = serde_json::to_vec_pretty(settings)?;
+    json.push(b'\n');
+    write_atomic(dir, FILE, &json)
 }
 
 /// Keeps each recognised, valid field and uses the default for the rest,
 /// exactly like the Electron app's `normalizeSettings`.
-pub fn normalize_settings(value: &Value) -> AppSettings {
+fn normalize_settings(value: &Value) -> AppSettings {
     let mut settings = AppSettings::default();
     let Some(object) = value.as_object() else {
         return settings;
@@ -61,23 +49,19 @@ pub fn normalize_settings(value: &Value) -> AppSettings {
                 Value::String(folder) => settings.library_folder = Some(folder.clone()),
                 _ => {}
             },
-            "theme" => match value.as_str() {
-                Some("light") => settings.theme = Theme::Light,
-                Some("dark") => settings.theme = Theme::Dark,
-                Some("system") => settings.theme = Theme::System,
-                _ => {}
-            },
+            "theme" => {
+                if let Ok(theme) = serde_json::from_value(value.clone()) {
+                    settings.theme = theme;
+                }
+            }
             "crossfadeDurationSeconds" => {
                 if let Some(seconds) = integer_in(value, 0, AppSettings::MAX_CROSSFADE_SECONDS) {
                     settings.crossfade_duration_seconds = seconds;
                 }
             }
             "downloadCacheSizeGiB" => {
-                if let Some(gib) = integer_in(
-                    value,
-                    AppSettings::MIN_CACHE_GIB,
-                    AppSettings::MAX_CACHE_GIB,
-                ) {
+                let (min, max) = (AppSettings::MIN_CACHE_GIB, AppSettings::MAX_CACHE_GIB);
+                if let Some(gib) = integer_in(value, min, max) {
                     settings.download_cache_size_gib = gib;
                 }
             }
@@ -100,6 +84,7 @@ fn integer_in(value: &Value, min: u32, max: u32) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    use elizabeats_core::Theme;
     use serde_json::json;
 
     use super::*;
@@ -117,35 +102,26 @@ mod tests {
 
     #[test]
     fn library_folder_rules() {
-        assert_eq!(
-            normalized(json!({"libraryFolder": "/Music"}))
-                .library_folder
-                .as_deref(),
-            Some("/Music")
-        );
-        assert_eq!(
-            normalized(json!({"libraryFolder": ""}))
-                .library_folder
-                .as_deref(),
-            Some("")
-        );
-        assert_eq!(
-            normalized(json!({"libraryFolder": null})).library_folder,
-            None
-        );
-        for invalid in [json!(1), json!(false), json!(["/a"]), json!({"a": 1})] {
-            assert_eq!(
-                normalized(json!({ "libraryFolder": invalid })).library_folder,
-                None
-            );
+        let folder = |value: Value| normalized(json!({ "libraryFolder": value })).library_folder;
+        assert_eq!(folder(json!("/Music")).as_deref(), Some("/Music"));
+        assert_eq!(folder(json!("")).as_deref(), Some(""));
+        for invalid in [
+            json!(null),
+            json!(1),
+            json!(false),
+            json!(["/a"]),
+            json!({"a": 1}),
+        ] {
+            assert_eq!(folder(invalid), None);
         }
     }
 
     #[test]
     fn theme_rules() {
-        assert_eq!(normalized(json!({"theme": "light"})).theme, Theme::Light);
-        assert_eq!(normalized(json!({"theme": "dark"})).theme, Theme::Dark);
-        assert_eq!(normalized(json!({"theme": "system"})).theme, Theme::System);
+        let theme = |value: Value| normalized(json!({ "theme": value })).theme;
+        assert_eq!(theme(json!("light")), Theme::Light);
+        assert_eq!(theme(json!("dark")), Theme::Dark);
+        assert_eq!(theme(json!("system")), Theme::System);
         for invalid in [
             json!("Dark"),
             json!("blue"),
@@ -153,7 +129,7 @@ mod tests {
             json!(null),
             json!(1),
         ] {
-            assert_eq!(normalized(json!({ "theme": invalid })).theme, Theme::System);
+            assert_eq!(theme(invalid), Theme::System);
         }
     }
 
@@ -219,10 +195,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_corrupt_file_gives_defaults() {
+    fn missing_or_corrupt_file_gives_defaults_without_writing() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(load_settings(dir.path()), AppSettings::default());
-        std::fs::write(dir.path().join(SETTINGS_FILE), "{not json").unwrap();
+        assert!(!dir.path().join(FILE).exists());
+        std::fs::write(dir.path().join(FILE), "{not json").unwrap();
         assert_eq!(load_settings(dir.path()), AppSettings::default());
     }
 
@@ -237,15 +214,8 @@ mod tests {
         };
         save_settings(dir.path(), &settings).unwrap();
         assert_eq!(load_settings(dir.path()), settings);
-        let text = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(FILE)).unwrap();
         assert!(text.contains("\"downloadCacheSizeGiB\": 20"));
         assert!(text.ends_with("}\n"));
-    }
-
-    #[test]
-    fn missing_settings_give_defaults_without_writing() {
-        let root = tempfile::tempdir().unwrap();
-        assert_eq!(load_settings(root.path()), AppSettings::default());
-        assert!(!root.path().join(SETTINGS_FILE).exists());
     }
 }
