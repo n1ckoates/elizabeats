@@ -1,0 +1,362 @@
+---
+import PageLayout from "blume/components/layout/PageLayout.astro";
+import data from "blume:data";
+import "../lib/buttons.css";
+
+const { config } = data;
+
+const features = [
+	{
+		title: "Local files and YouTube Music",
+		body: "Search across your music folder and YouTube Music. YouTube tracks are downloaded and cached for next time.",
+		icon: ["M11 3a8 8 0 1 0 0 16 8 8 0 0 0 0-16Z", "m21 21-4.3-4.3"],
+	},
+	{
+		title: "Talk breaks",
+		body: "Add breaks in the queue, where playback will stop until you skip it.",
+		icon: [
+			"M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z",
+			"M19 10v2a7 7 0 0 1-14 0v-2",
+			"M12 19v3",
+		],
+	},
+	{
+		title: "On-air clock",
+		body: "Time left in the track, time until the next break, and time until the top of the hour.",
+		icon: ["M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Z", "M12 6v6l4 2"],
+	},
+	{
+		title: "Crossfades",
+		body: "Tracks crossfade into each other, with an adjustable duration.",
+		icon: ["M8 4a8 8 0 1 0 0 16 8 8 0 0 0 0-16Z", "M16 4a8 8 0 1 1 0 16"],
+	},
+	{
+		title: "Crash recovery",
+		body: "If the app closes mid-show, your queue is still there when you reopen it.",
+		icon: ["M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8", "M3 3v5h5"],
+	},
+	{
+		title: "Play log",
+		body: "A history of everything that played and when.",
+		icon: [
+			"M21 15V6",
+			"M18.5 18a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z",
+			"M12 12H3M16 6H3M12 18H3",
+		],
+	},
+];
+---
+
+<PageLayout
+	site={{ title: config.title, description: config.description }}
+	logo={config.logo}
+	banner={config.banner}
+	analytics={config.analytics}
+	navigation={data.navigation}
+	favicon={config.favicon}
+	appleIcon={config.appleIcon}
+	fontCssVars={data.fontCssVars}
+	themeMode={config.theme.mode}
+	searchEnabled={config.search.enabled}
+	siteUrl={config.site}
+	ogEnabled={config.og.enabled}
+	structuredDataEnabled={config.structuredData}
+	page={{
+		title: "Elizabeats: Simple radio playout for DJs",
+		description: config.description,
+	}}
+>
+	<div class="home">
+		<section class="hero">
+			<div class="hero-text">
+				<h1>You pick the music. Elizabeats plays it.</h1>
+				<p class="lead">{config.description}</p>
+				<div class="actions">
+					<a class="button primary" href="/download" data-download>
+						<svg
+							aria-hidden="true"
+							width="16"
+							height="16"
+							viewBox="0 0 24 24"
+							fill="none"
+							stroke="currentColor"
+							stroke-width="2"
+							stroke-linecap="round"
+							stroke-linejoin="round"
+							><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><path
+								d="m7 10 5 5 5-5"></path><path d="M12 15V3"></path></svg
+						>
+						<span data-download-label>Download</span>
+					</a>
+					<a class="button secondary" href="/download">Other downloads</a>
+					<a class="button ghost" href="/docs">
+						Read the docs
+						<svg
+							aria-hidden="true"
+							width="16"
+							height="16"
+							viewBox="0 0 24 24"
+							fill="none"
+							stroke="currentColor"
+							stroke-width="2"
+							stroke-linecap="round"
+							stroke-linejoin="round"
+							><path d="M5 12h14"></path><path d="m12 5 7 7-7 7"></path></svg
+						>
+					</a>
+				</div>
+			</div>
+			<div class="mascot">
+				<img
+					src="/icon.png"
+					alt="Eliza, the Elizabeats mascot, wearing headphones"
+					width="250"
+					height="250"
+				/>
+			</div>
+		</section>
+
+		<section class="screenshot">
+			<img
+				src="/images/app.webp"
+				alt="The Elizabeats window: an on-air clock across the top, the queue on the left with a track playing and two talk breaks, and YouTube Music search results on the right"
+				width="2000"
+				height="1149"
+			/>
+		</section>
+
+		<section class="features">
+			<h2>Features</h2>
+			<div class="grid">
+				{
+					features.map((feature) => (
+						<div class="card">
+							<div class="icon">
+								<svg
+									aria-hidden="true"
+									width="18"
+									height="18"
+									viewBox="0 0 24 24"
+									fill="none"
+									stroke="currentColor"
+									stroke-width="2"
+									stroke-linecap="round"
+									stroke-linejoin="round"
+								>
+									{feature.icon.map((d) => (
+										<path d={d} />
+									))}
+								</svg>
+							</div>
+							<h3>{feature.title}</h3>
+							<p>{feature.body}</p>
+						</div>
+					))
+				}
+			</div>
+		</section>
+
+		<section class="closing">
+			<img src="/icon.png" alt="" width="88" height="88" />
+			<h2>Ready for your next show?</h2>
+			<p>Free and open source.</p>
+			<div class="actions">
+				<a class="button primary" href="/download" data-download>Download Elizabeats</a>
+				<a class="button secondary" href="/docs">Get started</a>
+			</div>
+		</section>
+	</div>
+</PageLayout>
+
+<script>
+	import { detectPlatform } from "../lib/downloads";
+
+	// Point the download buttons straight at the right file. Without a match
+	// (or without JavaScript) they lead to the download page instead.
+	async function updateDownloadButtons() {
+		const platform = await detectPlatform();
+		if (!platform) return;
+		for (const link of document.querySelectorAll<HTMLAnchorElement>("[data-download]")) {
+			link.href = platform.files[0].url;
+			const label = link.querySelector("[data-download-label]");
+			if (label) label.textContent = platform.button;
+		}
+	}
+
+	document.addEventListener("astro:page-load", updateDownloadButtons);
+</script>
+
+<style>
+	.home {
+		--home-width: 76rem;
+		color: var(--blume-foreground);
+	}
+
+	section {
+		max-width: var(--home-width);
+		margin: 0 auto;
+		padding-inline: 1.5rem;
+	}
+
+	h1,
+	h2,
+	h3 {
+		margin: 0;
+		font-family: var(--blume-font-display);
+		font-weight: 600;
+	}
+
+	h2 {
+		font-size: 2.25rem;
+		line-height: 1.15;
+		letter-spacing: -0.04em;
+	}
+
+	p {
+		margin: 0;
+	}
+
+	.hero {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 3rem 4rem;
+		padding-block: 5.5rem 4.5rem;
+	}
+
+	.hero-text {
+		flex: 999 1 32rem;
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 1.5rem;
+	}
+
+	h1 {
+		max-width: 13ch;
+		font-size: clamp(2.5rem, 6vw, 4rem);
+		line-height: 1.04;
+		letter-spacing: -0.045em;
+	}
+
+	.lead {
+		max-width: 34rem;
+		font-size: 1.1875rem;
+		line-height: 1.6;
+		color: var(--blume-muted-foreground);
+	}
+
+	.actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.75rem;
+		padding-top: 0.5rem;
+	}
+
+	.mascot {
+		flex: 1 1 18.75rem;
+		display: flex;
+		justify-content: center;
+	}
+
+	.mascot img {
+		flex: none;
+		width: 18.75rem;
+		height: 18.75rem;
+		padding: 1.5625rem;
+		box-sizing: border-box;
+		border-radius: 50%;
+		background: var(--blume-muted);
+		border: 1px solid var(--blume-border);
+	}
+
+	@media (max-width: 40rem) {
+		.mascot img {
+			width: 12.5rem;
+			height: 12.5rem;
+			padding: 1rem;
+		}
+	}
+
+	.screenshot {
+		padding-bottom: 6rem;
+	}
+
+	.screenshot img {
+		display: block;
+		width: 100%;
+		height: auto;
+		/* Clip to the window's own 26px corners (as a share of the 2000×1149
+		   image, so it scales). Outside them the capture has leftover dark
+		   pixels that would otherwise show as square, grey corners. */
+		border-radius: 1.3% / 2.263%;
+		box-shadow:
+			0 1px 3px rgb(0 0 0 / 0.06),
+			0 8px 24px rgb(0 0 0 / 0.06);
+	}
+
+	.features {
+		display: flex;
+		flex-direction: column;
+		gap: 2.5rem;
+		padding-bottom: 6rem;
+	}
+
+	.grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(min(20rem, 100%), 1fr));
+		gap: 1rem;
+	}
+
+	.card {
+		display: flex;
+		flex-direction: column;
+		gap: 0.625rem;
+		padding: 1.5rem;
+		border: 1px solid var(--blume-border);
+		border-radius: 0.75rem;
+	}
+
+	.card .icon {
+		width: 2.25rem;
+		height: 2.25rem;
+		margin-bottom: 0.375rem;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		border-radius: var(--blume-radius);
+		background: var(--blume-muted);
+		color: var(--blume-accent);
+	}
+
+	h3 {
+		font-size: 1.0625rem;
+		letter-spacing: -0.02em;
+	}
+
+	.card p {
+		font-size: 0.9375rem;
+		line-height: 1.6;
+		color: var(--blume-muted-foreground);
+	}
+
+	.closing {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 1.25rem;
+		padding-block: 6rem;
+		border-top: 1px solid var(--blume-border);
+		text-align: center;
+	}
+
+	.closing p {
+		font-size: 1.0625rem;
+		color: var(--blume-muted-foreground);
+	}
+
+	.closing .actions {
+		justify-content: center;
+	}
+</style>
