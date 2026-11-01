@@ -1,0 +1,38 @@
+.button {
+	display: inline-flex;
+	align-items: center;
+	gap: 0.5rem;
+	height: 2.75rem;
+	padding-inline: 1.125rem;
+	border-radius: var(--blume-radius);
+	font-size: 0.9375rem;
+	font-weight: 500;
+	text-decoration: none;
+	transition:
+		background-color 0.15s,
+		opacity 0.15s;
+}
+
+.button.primary {
+	background: var(--blume-accent);
+	color: var(--blume-accent-foreground);
+}
+
+.button.primary:hover {
+	opacity: 0.9;
+}
+
+.button.secondary {
+	border: 1px solid var(--blume-border);
+	color: var(--blume-foreground);
+}
+
+.button.secondary:hover,
+.button.ghost:hover {
+	background: var(--blume-muted);
+}
+
+.button.ghost {
+	padding-inline: 0.5rem;
+	color: var(--blume-foreground);
+}
