@@ -4,7 +4,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use elizabeats_botguard::{AudioStream, BotguardError, BotguardService, HelperOptions};
@@ -63,6 +63,18 @@ fn is_running(pid: u32) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// Waits until `count` helpers have started (each records itself in
+/// `<marker>.started`). The bound is generous, only so a broken helper fails
+/// the test; how long starting takes never matters.
+fn wait_until_started(marker: &Path, count: usize) {
+    let started = marker.with_extension("pid.started");
+    let until = Instant::now() + Duration::from_secs(60);
+    while std::fs::read_to_string(&started).map_or(0, |pids| pids.lines().count()) < count {
+        assert!(Instant::now() < until, "helper {count} never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[cfg(unix)]
 fn wait_until_gone(pid: u32) {
     let until = Instant::now() + Duration::from_secs(5);
@@ -110,11 +122,15 @@ async fn resolves_streams_through_one_helper() {
 
 #[tokio::test]
 async fn hung_helper_is_killed_and_replaced() {
-    // The timeout also covers starting the helper process, which can take
-    // a while on a busy CI machine; if it's too short, the helper is killed
-    // before it even writes the marker file and the test fails spuriously.
-    let timeout = Duration::from_secs(3);
-    let (_dir, marker, service) = service("hang-once", timeout, timeout);
+    let timeout = Duration::from_millis(800);
+    // A long mint timeout, so prewarming can take as long as starting the
+    // helper takes (slow when CI loads WebKitGTK cold).
+    let (_dir, marker, service) = service("hang-once", Duration::from_secs(60), timeout);
+    // Start the helper first, so the timed part below measures only the
+    // requests, never how long the process took to start.
+    service.prewarm();
+    wait_until_started(&marker, 1);
+
     // Two requests in flight: the helper never answers the first one but
     // does answer the second.
     let started = Instant::now();
@@ -123,7 +139,7 @@ async fn hung_helper_is_killed_and_replaced() {
         service.resolve_audio_stream("bbbbbbbbbbb")
     );
     assert!(matches!(a, Err(BotguardError::Timeout)), "{a:?}");
-    assert_fast(started, timeout + Duration::from_secs(3));
+    assert_fast(started, Duration::from_secs(3));
     let hung_pid = marker_pid(&marker);
     assert_eq!(helper_pid(&b.unwrap()), hung_pid);
 
@@ -132,6 +148,8 @@ async fn hung_helper_is_killed_and_replaced() {
     wait_until_gone(hung_pid);
 
     // ... and the next request gets a fresh helper, which answers.
+    service.prewarm();
+    wait_until_started(&marker, 2);
     let stream = service.resolve_audio_stream(VIDEO).await.unwrap();
     assert_ne!(helper_pid(&stream), hung_pid);
 }
