@@ -1840,7 +1840,7 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 
 [[package]]
 name = "elizabeats"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "chrono",
  "elizabeats-audio",
@@ -1862,7 +1862,7 @@ dependencies = [
 
 [[package]]
 name = "elizabeats-audio"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "cpal",
  "elizabeats-core",
@@ -1874,7 +1874,7 @@ dependencies = [
 
 [[package]]
 name = "elizabeats-botguard"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "reqwest",
  "serde",
@@ -1890,7 +1890,7 @@ dependencies = [
 
 [[package]]
 name = "elizabeats-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "chrono",
  "serde",
@@ -1902,7 +1902,7 @@ dependencies = [
 
 [[package]]
 name = "elizabeats-library"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "elizabeats-core",
  "lofty",
@@ -1913,7 +1913,7 @@ dependencies = [
 
 [[package]]
 name = "elizabeats-store"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "chrono",
  "dirs 6.0.0",
@@ -1928,7 +1928,7 @@ dependencies = [
 
 [[package]]
 name = "elizabeats-youtube"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "chrono",
  "elizabeats-botguard",
