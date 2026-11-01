@@ -146,18 +146,32 @@ impl AppView {
                 gpui_kit::linear_color_stop(background, 0.45),
             )))
             .child(
-                div().absolute().left_5().right_5().bottom_4().child(
-                    Input::new(&self.search_input)
-                        .prefix(
-                            Icon::new(IconName::Search)
-                                .small()
-                                .text_color(cx.theme().muted_foreground),
-                        )
-                        .suffix(
-                            Kbd::new(Keystroke::parse("secondary-k").unwrap_or_default()).outline(),
-                        )
-                        .cleanable(false),
-                ),
+                // The input and the opaque strip around it swallow the mouse, so
+                // pressing or dragging there never reaches the result row hidden
+                // beneath (which would start a track drag instead of selecting
+                // text). The faded top of the gradient stays click-through.
+                div()
+                    .id("search-box")
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .px_5()
+                    .pb_4()
+                    .occlude()
+                    .child(
+                        Input::new(&self.search_input)
+                            .prefix(
+                                Icon::new(IconName::Search)
+                                    .small()
+                                    .text_color(cx.theme().muted_foreground),
+                            )
+                            .suffix(
+                                Kbd::new(Keystroke::parse("secondary-k").unwrap_or_default())
+                                    .outline(),
+                            )
+                            .cleanable(false),
+                    ),
             )
     }
 
