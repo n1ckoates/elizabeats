@@ -1,0 +1,165 @@
+---
+import PageLayout from "blume/components/layout/PageLayout.astro";
+import data from "blume:data";
+import { platforms, releaseNotes } from "../lib/downloads";
+import "../lib/buttons.css";
+
+const { config } = data;
+---
+
+<PageLayout
+	site={{ title: config.title, description: config.description }}
+	logo={config.logo}
+	banner={config.banner}
+	analytics={config.analytics}
+	navigation={data.navigation}
+	favicon={config.favicon}
+	appleIcon={config.appleIcon}
+	fontCssVars={data.fontCssVars}
+	themeMode={config.theme.mode}
+	searchEnabled={config.search.enabled}
+	siteUrl={config.site}
+	ogEnabled={config.og.enabled}
+	structuredDataEnabled={config.structuredData}
+	page={{
+		title: "Download Elizabeats",
+		description: "Download Elizabeats for macOS, Windows and Linux.",
+	}}
+>
+	<section class="download">
+		<div class="intro">
+			<h1>Download Elizabeats</h1>
+		</div>
+
+		<div class="platforms">
+			{
+				platforms.map((platform) => (
+					<div class="platform" data-platform={platform.id}>
+						<div class="heading">
+							<h2>{platform.name}</h2>
+							<span class="badge">Your system</span>
+						</div>
+						<div class="files">
+							{platform.files.map((file) => (
+								<a class="button secondary" href={file.url}>
+									{file.label}
+								</a>
+							))}
+						</div>
+					</div>
+				))
+			}
+		</div>
+	</section>
+</PageLayout>
+
+<script>
+	import { detectPlatform } from "../lib/downloads";
+
+	// Highlight the visitor's platform and make its first file the main button.
+	async function markCurrentPlatform() {
+		const platform = await detectPlatform();
+		const card =
+			platform && document.querySelector(`[data-platform="${platform.id}"]`);
+		if (!card) return;
+		card.setAttribute("data-current", "");
+		card.querySelector(".button")?.classList.replace("secondary", "primary");
+	}
+
+	document.addEventListener("astro:page-load", markCurrentPlatform);
+</script>
+
+<style>
+	.download {
+		max-width: 48rem;
+		margin: 0 auto;
+		padding: 5rem 1.5rem 6rem;
+		display: flex;
+		flex-direction: column;
+		gap: 2.5rem;
+		color: var(--blume-foreground);
+	}
+
+	.intro {
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
+	}
+
+	h1,
+	h2 {
+		margin: 0;
+		font-family: var(--blume-font-display);
+		font-weight: 600;
+	}
+
+	h1 {
+		font-size: clamp(2.25rem, 5vw, 3rem);
+		line-height: 1.1;
+		letter-spacing: -0.045em;
+	}
+
+	.intro p {
+		margin: 0;
+		font-size: 1.0625rem;
+		line-height: 1.6;
+		color: var(--blume-muted-foreground);
+	}
+
+	.intro a {
+		color: var(--blume-foreground);
+		text-underline-offset: 3px;
+	}
+
+	.platforms {
+		display: flex;
+		flex-direction: column;
+		gap: 1rem;
+	}
+
+	.platform {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		justify-content: space-between;
+		gap: 1rem;
+		padding: 1.25rem 1.5rem;
+		border: 1px solid var(--blume-border);
+		border-radius: 0.75rem;
+	}
+
+	.platform[data-current] {
+		border-color: var(--blume-accent);
+	}
+
+	.heading {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+	}
+
+	h2 {
+		font-size: 1.125rem;
+		letter-spacing: -0.02em;
+	}
+
+	.badge {
+		display: none;
+		padding: 0.125rem 0.5rem;
+		border-radius: 999px;
+		background: var(--blume-accent);
+		color: var(--blume-accent-foreground);
+		font-size: 0.75rem;
+		font-weight: 500;
+	}
+
+	.platform[data-current] .badge {
+		display: inline-block;
+	}
+
+	.files {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.75rem;
+	}
+</style>
