@@ -758,6 +758,46 @@ async fn several_queue_items_can_be_selected_and_edited_together(cx: &mut TestAp
 }
 
 #[gpui_kit::test]
+async fn dragging_on_the_search_box_does_not_drag_the_row_behind_it(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let library = tempfile::tempdir().unwrap();
+    // Enough results that a row scrolls under the floating search box.
+    for index in 0..40 {
+        write_wav(&library.path().join(format!("Track {index:02}.wav")));
+    }
+    elizabeats_store::save_settings(
+        dir.path(),
+        &AppSettings {
+            library_folder: Some(library.path().to_string_lossy().into_owned()),
+            ..AppSettings::default()
+        },
+    )
+    .unwrap();
+    let (window, view) = open_app(cx, dir.path());
+
+    let mut found = false;
+    for _ in 0..100 {
+        cx.run_until_parked();
+        found = view.read_with(cx, |view, cx| view.search.read(cx).tracks().len() >= 40);
+        if found {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(found, "local Tracks never appeared in search results");
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let start = window.find("search-box").bounds().center();
+        let end = window.find("queue-empty").bounds().center();
+        window.drag(start, end, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(queue_len(&view, cx), 0, "a hidden search row was dragged");
+}
+
+#[gpui_kit::test]
 async fn settings_button_opens_settings(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let (window, _view) = open_app(cx, dir.path());
