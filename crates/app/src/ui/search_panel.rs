@@ -152,6 +152,7 @@ impl AppView {
                 // text). The faded top of the gradient stays click-through.
                 div()
                     .id("search-box")
+                    .test_support()
                     .absolute()
                     .left_0()
                     .right_0()
