@@ -110,7 +110,10 @@ async fn resolves_streams_through_one_helper() {
 
 #[tokio::test]
 async fn hung_helper_is_killed_and_replaced() {
-    let timeout = Duration::from_millis(800);
+    // The timeout also covers starting the helper process, which can take
+    // a while on a busy CI machine; if it's too short, the helper is killed
+    // before it even writes the marker file and the test fails spuriously.
+    let timeout = Duration::from_secs(3);
     let (_dir, marker, service) = service("hang-once", timeout, timeout);
     // Two requests in flight: the helper never answers the first one but
     // does answer the second.
@@ -120,7 +123,7 @@ async fn hung_helper_is_killed_and_replaced() {
         service.resolve_audio_stream("bbbbbbbbbbb")
     );
     assert!(matches!(a, Err(BotguardError::Timeout)), "{a:?}");
-    assert_fast(started, Duration::from_secs(3));
+    assert_fast(started, timeout + Duration::from_secs(3));
     let hung_pid = marker_pid(&marker);
     assert_eq!(helper_pid(&b.unwrap()), hung_pid);
 
