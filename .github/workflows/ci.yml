@@ -1,10 +1,9 @@
 name: CI
 
+# Checks and test builds for pull requests, so a pull request can be tried by
+# downloading its builds from the run. Pushes to main are handled by main.yml.
 # Changes that only touch the website (web/, deployed by Vercel) skip this.
 on:
-  push:
-    branches: [main]
-    paths-ignore: ["web/**"]
   pull_request:
     paths-ignore: ["web/**"]
   workflow_dispatch:

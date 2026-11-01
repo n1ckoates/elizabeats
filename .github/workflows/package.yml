@@ -5,7 +5,7 @@ name: Package
 # - CI (release: false): test builds, versioned like 1.0.0-dev.42, that don't
 #   update themselves. The downloads are attached to the run.
 # - Release (release: true): the real version, with delta updates from the
-#   previous release; the files go to the release workflow to publish.
+#   previous release; main.yml publishes the files.
 on:
   workflow_call:
     inputs:
@@ -106,7 +106,7 @@ jobs:
           path: ${{ matrix.portable }}
           archive: false
           if-no-files-found: error
-      # Releases: everything the release publishes, for the release workflow.
+      # Releases: everything the release publishes, for main.yml to publish.
       - uses: actions/upload-artifact@v7
         if: ${{ inputs.release }}
         with:

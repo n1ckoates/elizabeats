@@ -13,7 +13,7 @@
 # major. Changes users don't notice (refactors, CI, docs) don't need a file.
 # Only change files may live in .changeset/: knope reads every file there.
 #
-# .github/workflows/release.yml runs on every push to main:
+# .github/workflows/main.yml runs on every push to main:
 # - prepare-release, while the current version is already released: collects
 #   the change files into a "Release Elizabeats" pull request that bumps the
 #   version and adds a CHANGELOG.md section.
@@ -47,6 +47,14 @@ command = "git switch -c release"
 
 [[workflows.steps]]
 type = "PrepareRelease"
+
+# knope titles changelog sections "1.2.3 (date)", using the day this pull
+# request was last updated, which may not be the release day. Drop the date;
+# the GitHub release records when it was actually published.
+[[workflows.steps]]
+type = "Command"
+shell = true
+command = "sed -i -E 's/^(## [0-9]+\\.[0-9]+\\.[0-9]+) \\([0-9-]+\\)$/\\1/' CHANGELOG.md && git add CHANGELOG.md"
 
 [[workflows.steps]]
 type = "Command"

@@ -1,0 +1,112 @@
+name: Main
+
+# Everything for a push to main. Checks and builds always run (in parallel);
+# then, depending on whether the version in Cargo.toml has been released yet
+# (whether its v<version> tag exists):
+#
+# - Not released yet: the builds are release builds, and once the checks and
+#   all builds pass, knope creates the tag and GitHub release (notes from
+#   CHANGELOG.md) with the downloads attached. The tag only exists once
+#   publishing succeeded, so if anything fails, the next push to main (the
+#   fix) releases it.
+# - Already released: the builds are test builds (attached to the run), and
+#   the "Release Elizabeats <version>" pull request is updated with the change
+#   files in .changeset/ (knope.toml's prepare-release). Merging that pull
+#   request bumps the version, which releases it.
+#
+# Pull requests are checked and built by ci.yml instead. The release pull
+# request is opened with the built-in token, so GitHub doesn't run CI on it;
+# the release runs every check before publishing anyway. Needs "Allow GitHub
+# Actions to create and approve pull requests" in the repository's
+# Settings → Actions → General.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["web/**"]
+  workflow_dispatch:
+
+# Runs one at a time, in order, so a release finishes (and tags) before the
+# next push decides what to do.
+concurrency:
+  group: main
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: plan
+        run: |
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/v$version" > /dev/null; then
+            echo "$version is already released: test builds, and updating the release pull request."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$version isn't released yet: releasing it."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  checks:
+    uses: ./.github/workflows/checks.yml
+
+  package:
+    needs: plan
+    uses: ./.github/workflows/package.yml
+    with:
+      release: ${{ needs.plan.outputs.release == 'true' }}
+
+  publish:
+    name: Publish ${{ needs.plan.outputs.version }}
+    needs: [plan, checks, package]
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: artifacts
+          merge-multiple: true
+      - uses: knope-dev/action@v2.1.2
+        with:
+          version: 0.23.2
+      - run: knope release --verbose
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  prepare:
+    name: Update the release pull request
+    needs: plan
+    if: needs.plan.outputs.release == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - uses: knope-dev/action@v2.1.2
+        with:
+          version: 0.23.2
+      # Fails when there are no change files to release; that's fine.
+      - run: knope prepare-release --verbose
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        continue-on-error: true

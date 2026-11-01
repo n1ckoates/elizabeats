@@ -1,7 +1,7 @@
 name: Checks
 
-# Formatting, lints and tests. Called by CI (every push and pull request) and
-# by the release workflow, which only publishes when these pass.
+# Formatting, lints and tests. Called by CI (pull requests) and by main.yml
+# (pushes to main), which only publishes a release when these pass.
 on:
   workflow_call:
 
