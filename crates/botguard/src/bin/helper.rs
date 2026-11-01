@@ -9,10 +9,12 @@
 //!   - `echo`: answers mints with no tokens and resolves with a canned stream
 //!     whose URL contains this process's ID (so tests can tell helpers apart).
 //!   - `hang-once <marker file>`: if the marker file does not exist yet,
-//!     writes its process ID there and never answers its first request;
-//!     otherwise echoes.
+//!     writes its process ID there and never answers its first resolve
+//!     request; otherwise echoes. Mints (prewarming) are always answered.
+//!     Every helper started with a marker also appends its process ID to
+//!     `<marker>.started` once it's running, so tests can wait for it.
 //!   - `crash-once <marker file>`: like `hang-once`, but exits with code 3
-//!     on the first request instead of hanging.
+//!     on the first resolve request instead of hanging.
 //!   - `error`: answers every request with a (technical) error.
 //!   - `unavailable`: echoes mints; answers resolves with a user-facing
 //!     error ("This video is unavailable").
@@ -46,6 +48,16 @@ fn fake_minter(mode: &str, marker: Option<&str>) -> i32 {
         }
         _ => false,
     };
+    if let Some(path) = marker {
+        let started = format!("{path}.started");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(started);
+        if let Ok(file) = &mut file {
+            let _ = writeln!(file, "{pid}");
+        }
+    }
     let mut stdout = std::io::stdout();
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { return 1 };
@@ -55,8 +67,8 @@ fn fake_minter(mode: &str, marker: Option<&str>) -> i32 {
         let id = request["id"].as_u64().unwrap_or_default();
         let resolve = request["resolve"].as_str();
         let reply = match (mode, resolve) {
-            ("hang-once", _) if std::mem::take(&mut misbehave) => continue,
-            ("crash-once", _) if misbehave => return 3,
+            ("hang-once", Some(_)) if std::mem::take(&mut misbehave) => continue,
+            ("crash-once", Some(_)) if misbehave => return 3,
             ("error", _) => json!({ "id": id, "error": "fake failure" }),
             ("unavailable", Some(_)) => json!({
                 "id": id,
