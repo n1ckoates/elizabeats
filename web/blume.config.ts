@@ -1,6 +1,8 @@
 import { defineConfig } from "blume";
+import { vercel } from "blume/deploy";
 
 export default defineConfig({
+	deployment: vercel(),
 	title: "Elizabeats",
 	description:
 		"Simple radio playout for DJs. Search your local music folder and YouTube Music, queue up tracks and talk breaks, and Elizabeats plays it all while you’re on the mic.",
