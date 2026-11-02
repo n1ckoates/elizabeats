@@ -40,6 +40,13 @@ lto = "fat"
 codegen-units = 1
 strip = "symbols"
 
+# CI's dev builds: the same optimization level as release, but quicker to
+# build, at the cost of a slightly bigger app.
+[profile.dev-build]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+
 # Keep dependencies fast in debug builds so audio decoding is usable while developing.
 [profile.dev.package."*"]
 opt-level = 2

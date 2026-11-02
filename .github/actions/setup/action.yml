@@ -1,9 +1,9 @@
 name: Set up build tools
-description: Rust (from rust-toolchain.toml), Node + pnpm for the BotGuard JS bundle, and per-OS system dependencies.
+description: Rust, Node + pnpm (for the BotGuard JS bundle), and per-OS system libraries.
 
 inputs:
   cache-key:
-    description: Keeps the Rust build cache of jobs that would otherwise share one (e.g. two macOS packaging jobs for different chips) apart.
+    description: Separates the Rust cache of jobs that would otherwise share one (e.g. the two macOS builds).
     required: false
     default: ""
 
@@ -22,32 +22,28 @@ runs:
           libfontconfig-dev libfreetype-dev \
           libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev
 
-    # gpui compiles its Metal shaders at build time; newer Xcode versions
-    # download the Metal compiler separately.
+    # gpui compiles Metal shaders at build time, and newer Xcode versions
+    # don't include the Metal compiler.
     - name: Install the Metal shader compiler
       if: runner.os == 'macOS'
       shell: bash
       run: xcrun metal --version >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
 
-    # crates/botguard/build.rs bundles youtubei.js with Node and pnpm (and runs
-    # `pnpm install` itself, so this step doesn't).
+    # No install here: crates/botguard/build.rs runs `pnpm install` itself.
     - uses: pnpm/setup@v3
       with:
         version: 12
         runtime: node@26
         install: false
-        # Caches the downloaded JS packages.
         cache: true
         cache-dependency-path: crates/botguard/js/pnpm-lock.yaml
 
     - name: Install Rust
       shell: bash
-      # Installs the version and components pinned in rust-toolchain.toml.
       run: rustup toolchain install
 
-    # Caches downloaded crates and compiled dependencies. Also saved when a
-    # job fails (e.g. a failing test), so the compile work isn't lost. If a
-    # cache ever seems stuck half-built, bump `prefix-key` to start fresh.
+    # Saved even when a job fails, so the compile work isn't lost. If a cache
+    # ever seems stuck half-built, bump `prefix-key` to start fresh.
     - uses: Swatinem/rust-cache@v2
       with:
         key: ${{ inputs.cache-key }}

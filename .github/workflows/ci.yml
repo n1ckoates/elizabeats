@@ -1,24 +1,133 @@
 name: CI
 
-# Changes that only touch the website (web/, deployed by Vercel) skip this.
+# On main, the version in Cargo.toml decides what happens: if it has no
+# v<version> tag yet (the release PR was just merged), it's released;
+# otherwise the release PR is updated. The tag only exists once publishing
+# succeeds, so a failed release is retried by the next push to main.
 on:
+  pull_request:
+    paths-ignore: ["web/**"]
   push:
     branches: [main]
     paths-ignore: ["web/**"]
-  pull_request:
-    paths-ignore: ["web/**"]
   workflow_dispatch:
 
-# A newer push to the same branch or pull request cancels the older run.
+# Runs on main queue instead of cancelling, so a release always finishes
+# (and tags) before the next push decides what to do.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  checks:
-    uses: ./.github/workflows/checks.yml
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - run: cargo fmt --all --check
 
-  # Test builds (1.0.0-dev.<run>), alongside the checks for speed. A run can
-  # have downloads even if a check failed, so only use them from green runs.
-  package:
+  # Per OS, because lints and tests only see the code compiled for that OS.
+  check:
+    name: Check (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macOS, os: macos-latest }
+          - { name: Windows, os: windows-latest }
+          - { name: Linux, os: ubuntu-22.04 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+        with:
+          cache-key: ${{ matrix.name }}
+      - run: cargo lint
+      - run: cargo test --workspace
+
+  dev-build:
     uses: ./.github/workflows/package.yml
+
+  version:
+    name: Version
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      released: ${{ steps.version.outputs.released }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: version
+        run: |
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/v$version" > /dev/null; then
+            echo "released=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Starts right away, so a release takes as long as the slower of the
+  # checks and the builds, not both.
+  stable-build:
+    needs: version
+    if: needs.version.outputs.released == 'false'
+    uses: ./.github/workflows/package.yml
+    with:
+      stable: true
+
+  release:
+    name: Release
+    needs: [version, format, check, stable-build]
+    if: needs.version.outputs.released == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: stable-*
+          path: artifacts
+          merge-multiple: true
+      - uses: knope-dev/action@v2.1.2
+        with:
+          version: 0.23.2
+      - run: knope release --verbose
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  # Uses the built-in token, so GitHub won't run CI on the release PR. That's
+  # fine: the release itself runs every check. Needs "Allow GitHub Actions to
+  # create and approve pull requests" in Settings → Actions → General.
+  update-release-pr:
+    name: Update release PR
+    needs: version
+    if: needs.version.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - uses: knope-dev/action@v2.1.2
+        if: hashFiles('.changeset/*.md') != ''
+        with:
+          version: 0.23.2
+      - run: knope prepare-release --verbose
+        if: hashFiles('.changeset/*.md') != ''
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

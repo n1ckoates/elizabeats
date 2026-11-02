@@ -7,20 +7,20 @@
 #   rust-target  only when cross-building, e.g. x86_64-apple-darwin
 #
 # Build first: cargo build --release -p elizabeats [--target <rust-target>].
+# PROFILE names the Cargo profile it was built with, if not release.
 # On macOS, run scripts/compile-macos-icon.sh first for the macOS 26 icon.
 # With VELOPACK_DELTAS=1 and GITHUB_TOKEN set, the previous release is
 # downloaded first so updates from it can be small deltas.
 #
 # Output: Velopack's files in target/velopack/<channel>/, and in target/dist/
-# the files a release publishes: the downloads under stable names (e.g.
-# Elizabeats-Windows-Setup.exe) plus the update packages and feed the
-# updater reads.
+# the downloads plus the update packages and feed the updater reads (what a
+# release publishes).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 version=$1
 target=${2:-}
-bin_dir=target/${target:+$target/}release
+bin_dir=target/${target:+$target/}${PROFILE:-release}
 repository=https://github.com/n1ckoates/elizabeats
 
 # Each OS/architecture is its own Velopack channel, so an installed copy only
@@ -93,17 +93,24 @@ vpk pack \
   --outputDir "$out" \
   ${extra[@]+"${extra[@]}"}
 
-# The downloads, under names that never change, so links to
-# releases/latest/download/<name> always get the newest version.
+# The downloads. Releases use names that never change (e.g.
+# Elizabeats-Windows-Setup.exe), so links to releases/latest/download/<name>
+# always get the newest version; test builds say which build they are
+# (e.g. Elizabeats-1.0.2-dev.57-Windows-Setup.exe).
+if [[ "$version" == *-* ]]; then
+  name=Elizabeats-$version-$platform
+else
+  name=Elizabeats-$platform
+fi
 shopt -s nullglob
 for file in "$out"/*-Setup.exe "$out"/*-Setup.pkg; do
-  cp "$file" "target/dist/Elizabeats-$platform-Setup.${file##*.}"
+  cp "$file" "target/dist/$name-Setup.${file##*.}"
 done
 for file in "$out"/*-Portable.zip; do
-  cp "$file" "target/dist/Elizabeats-$platform-Portable.zip"
+  cp "$file" "target/dist/$name-Portable.zip"
 done
 for file in "$out"/*.AppImage; do
-  cp "$file" "target/dist/Elizabeats-$platform.AppImage"
+  cp "$file" "target/dist/$name.AppImage"
 done
 # What the updater reads: this version's packages and the channel's feed.
 for file in "$out"/*-"$version"-*.nupkg "$out/releases.$channel.json"; do
