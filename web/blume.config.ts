@@ -9,10 +9,6 @@ export default defineConfig({
 	logo: "/icon.png",
 	basePath: "/docs",
 	github: { owner: "n1ckoates", repo: "elizabeats" },
-	navigation: {
-		// basePath turns "/" into "/docs".
-		actions: [{ href: "/", label: "Docs" }],
-	},
 	theme: {
 		accent: "red",
 	},
