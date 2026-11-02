@@ -1,32 +1,9 @@
 name: CI
 
-# One workflow for pull requests and pushes to main.
-#
-# Always (pull requests and main):
-# - Format, Check: formatting once; lints and tests on each OS.
-# - Dev build: test builds (1.0.2-dev.<run>) attached to the run, so a pull
-#   request can be tried without building it locally.
-#
-# On main, depending on whether the version in Cargo.toml has been released
-# (whether its v<version> tag exists):
-# - Not released yet (the release pull request was just merged):
-#   - Stable build: release builds, started right away (in parallel with the
-#     checks).
-#   - Release: once the checks and every stable build pass, knope creates the
-#     tag and GitHub release (notes from CHANGELOG.md) with the downloads. The
-#     tag only exists once publishing succeeded, so if anything fails, the
-#     next push to main (the fix) releases it.
-# - Already released:
-#   - Update release PR: the "Release Elizabeats <version>" pull request gets
-#     the change files in .changeset/ (knope.toml's prepare-release). Merging
-#     it bumps the version, which releases it.
-#
-# The release pull request is opened with the built-in token, so GitHub
-# doesn't run this workflow on it; the release runs every check before
-# publishing anyway. Needs "Allow GitHub Actions to create and approve pull
-# requests" in the repository's Settings → Actions → General.
-#
-# Changes that only touch the website (web/, deployed by Vercel) skip this.
+# On main, the version in Cargo.toml decides what happens: if it has no
+# v<version> tag yet (the release PR was just merged), it's released;
+# otherwise the release PR is updated. The tag only exists once publishing
+# succeeds, so a failed release is retried by the next push to main.
 on:
   pull_request:
     paths-ignore: ["web/**"]
@@ -35,9 +12,8 @@ on:
     paths-ignore: ["web/**"]
   workflow_dispatch:
 
-# A newer push to a pull request cancels its older run. Runs on main never
-# cancel: they queue, so a release always finishes (and tags) before the next
-# push decides what to do.
+# Runs on main queue instead of cancelling, so a release always finishes
+# (and tags) before the next push decides what to do.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -46,17 +22,15 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Formatting is the same everywhere and needs no build, so it runs once.
   format:
     name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Install Rust
-        run: rustup toolchain install
+      - run: rustup toolchain install
       - run: cargo fmt --all --check
 
-  # Lints and tests run per OS: they only see code compiled for that OS.
+  # Per OS, because lints and tests only see the code compiled for that OS.
   check:
     name: Check (${{ matrix.name }})
     strategy:
@@ -72,15 +46,12 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           cache-key: ${{ matrix.name }}
-      - name: Lints
-        run: cargo lint
-      - name: Tests
-        run: cargo test --workspace
+      - run: cargo lint
+      - run: cargo test --workspace
 
   dev-build:
     uses: ./.github/workflows/package.yml
 
-  # Main only: is the version in Cargo.toml released yet?
   version:
     name: Version
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
@@ -97,13 +68,13 @@ jobs:
           version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
           echo "version=$version" >> "$GITHUB_OUTPUT"
           if git rev-parse -q --verify "refs/tags/v$version" > /dev/null; then
-            echo "$version is already released."
             echo "released=true" >> "$GITHUB_OUTPUT"
           else
-            echo "$version isn't released yet: releasing it."
             echo "released=false" >> "$GITHUB_OUTPUT"
           fi
 
+  # Starts right away, so a release takes as long as the slower of the
+  # checks and the builds, not both.
   stable-build:
     needs: version
     if: needs.version.outputs.released == 'false'
@@ -134,6 +105,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
+  # Uses the built-in token, so GitHub won't run CI on the release PR. That's
+  # fine: the release itself runs every check. Needs "Allow GitHub Actions to
+  # create and approve pull requests" in Settings → Actions → General.
   update-release-pr:
     name: Update release PR
     needs: version
@@ -146,15 +120,14 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Configure Git
-        run: |
+      - run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
       - uses: knope-dev/action@v2.1.2
+        if: hashFiles('.changeset/*.md') != ''
         with:
           version: 0.23.2
-      # Fails when there are no change files to release; that's fine.
       - run: knope prepare-release --verbose
+        if: hashFiles('.changeset/*.md') != ''
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        continue-on-error: true

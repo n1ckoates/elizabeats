@@ -1,15 +1,9 @@
 name: Package
 
-# Builds and packages the app on each OS with Velopack (scripts/package.sh),
-# plus the Microsoft Store MSIX on Windows (scripts/package-msix.sh).
-#
-# - Dev builds (stable: false), versioned like 1.0.2-dev.57: don't update
-#   themselves; every download (named Elizabeats-1.0.2-dev.57-…) is attached
-#   to the run for testing.
-# - Stable builds (stable: true), the real version: with delta updates from
-#   the previous release. The release job in ci.yml publishes their files
-#   (named Elizabeats-Windows-Setup.exe and so on); only the MSIX
-#   (Elizabeats-Windows.msix, for the Store) is attached to the run.
+# Dev builds (1.0.2-dev.<run>) don't update themselves, and are attached to
+# the run for testing. Stable builds are handed to ci.yml's release job, and
+# their downloads keep the same names every release so links to
+# releases/latest/download/<name> stay valid.
 on:
   workflow_call:
     inputs:
@@ -19,7 +13,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Keep in step with the velopack crate version in crates/app/Cargo.toml.
+  # Must match the velopack crate version in crates/app/Cargo.toml.
   VPK_VERSION: 1.2.161
 
 jobs:
@@ -27,8 +21,6 @@ jobs:
     name: ${{ inputs.stable && 'Stable' || 'Dev' }} build (${{ matrix.name }})
     strategy:
       fail-fast: false
-      # `installer` and `portable`: each platform's downloads in target/dist,
-      # attached to dev builds one file at a time. Linux's AppImage is both.
       matrix:
         include:
           - name: macOS Apple Silicon
@@ -36,7 +28,6 @@ jobs:
             os: macos-latest
             installer: target/dist/*-Setup.pkg
             portable: target/dist/*-Portable.zip
-          # Cross-built on the Apple Silicon runner.
           - name: macOS Intel
             slug: macos-x64
             os: macos-latest
@@ -48,32 +39,27 @@ jobs:
             os: windows-latest
             installer: target/dist/*-Setup.exe
             portable: target/dist/*-Portable.zip
-          # The oldest supported Ubuntu, so the AppImage runs on it and newer.
+          # The oldest supported Ubuntu, so the AppImage also runs on newer ones.
           - name: Linux
             slug: linux
             os: ubuntu-22.04
             installer: target/dist/*.AppImage
     runs-on: ${{ matrix.os }}
     env:
-      # Set only for a cross build (the steps add `--target` when it is).
       TARGET: ${{ matrix.target }}
-      # Stable builds show the plain version and update themselves.
       ELIZABEATS_RELEASE: ${{ inputs.stable && '1' || '' }}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
         with:
           cache-key: ${{ matrix.name }}
-      # Velopack's packaging tool (vpk) runs on .NET.
       - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 8.0.x
-      - name: Install vpk
-        run: dotnet tool install -g vpk --version ${{ env.VPK_VERSION }}
-
-      - name: Add the build target
-        if: matrix.target
+      - run: dotnet tool install -g vpk --version ${{ env.VPK_VERSION }}
+      - if: matrix.target
         run: rustup target add ${{ matrix.target }}
+
       - name: Version
         shell: bash
         run: |
@@ -86,9 +72,7 @@ jobs:
       - name: Build
         shell: bash
         run: cargo build --release -p elizabeats ${TARGET:+--target "$TARGET"}
-      # The Liquid Glass app icon for macOS 26+ (packaging copies it in).
-      - name: Compile the macOS icon
-        if: runner.os == 'macOS'
+      - if: runner.os == 'macOS'
         run: scripts/compile-macos-icon.sh
       - name: Package
         shell: bash
@@ -96,37 +80,32 @@ jobs:
           VELOPACK_DELTAS: ${{ inputs.stable && '1' || '' }}
           GITHUB_TOKEN: ${{ github.token }}
         run: scripts/package.sh "$VERSION" ${TARGET:+"$TARGET"}
-      # The Microsoft Store package (unsigned: the Store signs it). Submit the
-      # stable one by hand in Partner Center; the Store refuses dev ones.
-      - name: Package the Microsoft Store MSIX
-        if: runner.os == 'Windows'
+      - if: runner.os == 'Windows'
         shell: bash
         run: scripts/package-msix.sh "$VERSION"
 
-      # Dev builds: each download on its own (not zipped).
-      - uses: actions/upload-artifact@v7
-        if: ${{ !inputs.stable }}
+      # Unzipped, so each download keeps its own file name.
+      - if: ${{ !inputs.stable }}
+        uses: actions/upload-artifact@v7
         with:
           path: ${{ matrix.installer }}
           archive: false
           if-no-files-found: error
-      - uses: actions/upload-artifact@v7
-        if: ${{ !inputs.stable && matrix.portable }}
+      - if: ${{ !inputs.stable && matrix.portable }}
+        uses: actions/upload-artifact@v7
         with:
           path: ${{ matrix.portable }}
           archive: false
           if-no-files-found: error
-      # Both: the MSIX, to test or submit to the Store.
-      - uses: actions/upload-artifact@v7
-        if: runner.os == 'Windows'
+      # Stable too: the one to submit to the Microsoft Store.
+      - if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
         with:
           path: target/packages/*.msix
           archive: false
           if-no-files-found: error
-      # Stable builds: everything the release publishes, handed to the release
-      # job (which runs right after, so a few days is plenty).
-      - uses: actions/upload-artifact@v7
-        if: ${{ inputs.stable }}
+      - if: ${{ inputs.stable }}
+        uses: actions/upload-artifact@v7
         with:
           name: stable-${{ matrix.slug }}
           path: target/dist/*
