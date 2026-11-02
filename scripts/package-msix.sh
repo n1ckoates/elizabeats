@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Packs the Microsoft Store package (unsigned; the Store signs it) from an
-# already-built target/release/elizabeats.exe. Windows only: uses makeappx
+# already-built target/<PROFILE, default release>/elizabeats.exe. Windows only: uses makeappx
 # from the Windows SDK. The manifest is crates/app/windows/Package.appxmanifest.
 #
 # Usage: scripts/package-msix.sh <version>
@@ -32,7 +32,7 @@ sdk_bin=$(dirname "$(ls "/c/Program Files (x86)/Windows Kits/10/bin/"*/x64/makea
 stage=target/msix
 rm -rf "$stage"
 mkdir -p "$stage" target/packages
-cp target/release/elizabeats.exe "$stage/"
+cp "target/${PROFILE:-release}/elizabeats.exe" "$stage/"
 cp -r crates/app/windows/Assets "$stage/Assets"
 sed "s/Version=\"0.0.0.0\"/Version=\"$package_version\"/" \
   crates/app/windows/Package.appxmanifest > "$stage/AppxManifest.xml"

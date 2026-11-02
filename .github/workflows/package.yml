@@ -48,11 +48,13 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
       ELIZABEATS_RELEASE: ${{ inputs.stable && '1' || '' }}
+      # Dev builds skip release's size optimizations, which are slow to build.
+      PROFILE: ${{ inputs.stable && 'release' || 'dev-build' }}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
         with:
-          cache-key: ${{ matrix.name }}
+          cache-key: ${{ matrix.name }}-${{ env.PROFILE }}
       - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 8.0.x
@@ -71,7 +73,7 @@ jobs:
           echo "VERSION=$version" >> "$GITHUB_ENV"
       - name: Build
         shell: bash
-        run: cargo build --release -p elizabeats ${TARGET:+--target "$TARGET"}
+        run: cargo build --profile "$PROFILE" -p elizabeats ${TARGET:+--target "$TARGET"}
       - if: runner.os == 'macOS'
         run: scripts/compile-macos-icon.sh
       - name: Package

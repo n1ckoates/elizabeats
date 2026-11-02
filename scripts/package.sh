@@ -7,6 +7,7 @@
 #   rust-target  only when cross-building, e.g. x86_64-apple-darwin
 #
 # Build first: cargo build --release -p elizabeats [--target <rust-target>].
+# PROFILE names the Cargo profile it was built with, if not release.
 # On macOS, run scripts/compile-macos-icon.sh first for the macOS 26 icon.
 # With VELOPACK_DELTAS=1 and GITHUB_TOKEN set, the previous release is
 # downloaded first so updates from it can be small deltas.
@@ -19,7 +20,7 @@ cd "$(dirname "$0")/.."
 
 version=$1
 target=${2:-}
-bin_dir=target/${target:+$target/}release
+bin_dir=target/${target:+$target/}${PROFILE:-release}
 repository=https://github.com/n1ckoates/elizabeats
 
 # Each OS/architecture is its own Velopack channel, so an installed copy only
