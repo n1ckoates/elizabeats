@@ -2,6 +2,14 @@
 
 All notable changes to Elizabeats. Entries come from the files in `.changeset/` (see `knope.toml`).
 
+## 1.0.2
+
+### Fixes
+
+#### Cmd+K selects the search text
+
+Pressing Cmd+K (Ctrl+K on Windows and Linux) to jump to the search box now selects whatever is already in it, so you can start typing right away to replace it, like Cmd+L in a browser.
+
 ## 1.0.1
 
 ### Fixes
