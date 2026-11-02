@@ -1,0 +1,85 @@
+---
+import PageLayout from "blume/components/layout/PageLayout.astro";
+import data from "blume:data";
+import Button from "../components/Button.astro";
+import { platforms } from "../lib/downloads";
+
+const { config } = data;
+---
+
+<PageLayout
+	site={{ title: config.title, description: config.description }}
+	logo={config.logo}
+	banner={config.banner}
+	analytics={config.analytics}
+	navigation={data.navigation}
+	favicon={config.favicon}
+	appleIcon={config.appleIcon}
+	fontCssVars={data.fontCssVars}
+	themeMode={config.theme.mode}
+	searchEnabled={config.search.enabled}
+	siteUrl={config.site}
+	ogEnabled={config.og.enabled}
+	structuredDataEnabled={config.structuredData}
+	page={{
+		title: "Download Elizabeats",
+		description: "Download Elizabeats for macOS, Windows and Linux.",
+	}}
+>
+	<section class="mx-auto flex max-w-3xl flex-col gap-10 px-6 pt-20 pb-24 text-foreground">
+		<h1
+			class="font-display text-[clamp(2.25rem,5vw,3rem)] leading-[1.1] font-semibold tracking-[-0.045em]"
+		>
+			Download Elizabeats
+		</h1>
+
+		<div class="flex flex-col gap-4">
+			{
+				platforms.map((platform) => (
+					<div
+						class="group flex flex-wrap items-center justify-between gap-4 rounded-xl border border-border px-6 py-5 data-current:border-accent"
+						data-platform={platform.id}
+					>
+						<div class="flex items-center gap-3">
+							<h2 class="font-display text-lg font-semibold tracking-[-0.02em]">
+								{platform.name}
+							</h2>
+							<span class="hidden rounded-full bg-accent px-2 py-0.5 text-xs font-medium text-accent-foreground group-data-current:inline-block">
+								Your system
+							</span>
+						</div>
+						<div class="flex flex-wrap gap-3">
+							{platform.files.map((file, index) => (
+								<Button
+									href={file.url}
+									variant="secondary"
+									class={
+										// The visitor's own installer looks like the primary button.
+										index === 0 &&
+										"group-data-current:border-transparent group-data-current:bg-accent group-data-current:text-accent-foreground group-data-current:hover:bg-accent group-data-current:hover:opacity-90"
+									}
+								>
+									{file.label}
+								</Button>
+							))}
+						</div>
+					</div>
+				))
+			}
+		</div>
+	</section>
+</PageLayout>
+
+<script>
+	import { detectPlatform } from "../lib/downloads";
+
+	// Mark the visitor's platform; its card and first file are highlighted.
+	async function markCurrentPlatform() {
+		const platform = await detectPlatform();
+		document
+			.querySelector(`[data-platform="${platform?.id}"]`)
+			?.setAttribute("data-current", "");
+	}
+
+	document.addEventListener("astro:page-load", markCurrentPlatform);
+</script>

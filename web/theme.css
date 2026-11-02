@@ -1,0 +1,6 @@
+/* get rid of the default view transitions crossfade */
+::view-transition-group(*),
+::view-transition-old(*),
+::view-transition-new(*) {
+	animation: none !important;
+}

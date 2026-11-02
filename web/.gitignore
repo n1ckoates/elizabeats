@@ -2,3 +2,5 @@ node_modules/
 .blume/
 dist/
 .env.local
+.blume-verify/
+.vercel/

@@ -1,0 +1,213 @@
+---
+import PageLayout from "blume/components/layout/PageLayout.astro";
+import data from "blume:data";
+import Button from "../components/Button.astro";
+
+const { config } = data;
+
+const features = [
+	{
+		title: "Local files and YouTube Music",
+		body: "Search across your music folder and YouTube Music. YouTube tracks are downloaded and cached for next time.",
+		icon: ["M11 3a8 8 0 1 0 0 16 8 8 0 0 0 0-16Z", "m21 21-4.3-4.3"],
+	},
+	{
+		title: "Talk breaks",
+		body: "Add breaks in the queue, where playback will stop until you skip it.",
+		icon: [
+			"M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z",
+			"M19 10v2a7 7 0 0 1-14 0v-2",
+			"M12 19v3",
+		],
+	},
+	{
+		title: "On-air clock",
+		body: "Time left in the track, time until the next break, and time until the top of the hour.",
+		icon: ["M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Z", "M12 6v6l4 2"],
+	},
+	{
+		title: "Crossfades",
+		body: "Tracks crossfade into each other, with an adjustable duration.",
+		icon: ["M8 4a8 8 0 1 0 0 16 8 8 0 0 0 0-16Z", "M16 4a8 8 0 1 1 0 16"],
+	},
+	{
+		title: "Crash recovery",
+		body: "If the app closes mid-show, your queue is still there when you reopen it.",
+		icon: ["M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8", "M3 3v5h5"],
+	},
+	{
+		title: "Play log",
+		body: "A history of everything that played and when.",
+		icon: [
+			"M21 15V6",
+			"M18.5 18a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z",
+			"M12 12H3M16 6H3M12 18H3",
+		],
+	},
+];
+
+const section = "mx-auto max-w-[76rem] px-6";
+const heading = "font-display text-4xl leading-[1.15] font-semibold tracking-[-0.04em]";
+
+const screenshotAlt =
+	"The Elizabeats window: an on-air clock across the top, the queue on the left with a track playing and two talk breaks, and YouTube Music search results on the right";
+// Clipped to the window's own 26px corners (as a share of the 2000×1149
+// image, so it scales): outside them the capture has leftover dark pixels.
+// On phones it's too small to read whole, so it shows the clock and Queue
+// (the left half) at twice the size, fading out at the cut.
+const screenshot = [
+	"block h-auto w-full [border-radius:1.3%/2.263%] shadow-[0_1px_3px_rgb(0_0_0/0.06),0_8px_24px_rgb(0_0_0/0.06)]",
+	"max-sm:aspect-[1000/1149] max-sm:object-cover max-sm:object-left-top max-sm:[border-radius:2.6%_0_0_2.6%/2.263%_0_0_2.263%] max-sm:[mask-image:linear-gradient(to_right,black_94%,transparent)]",
+];
+---
+
+<PageLayout
+	site={{ title: config.title, description: config.description }}
+	logo={config.logo}
+	banner={config.banner}
+	analytics={config.analytics}
+	navigation={data.navigation}
+	favicon={config.favicon}
+	appleIcon={config.appleIcon}
+	fontCssVars={data.fontCssVars}
+	themeMode={config.theme.mode}
+	searchEnabled={config.search.enabled}
+	siteUrl={config.site}
+	ogEnabled={config.og.enabled}
+	structuredDataEnabled={config.structuredData}
+	page={{
+		title: "Elizabeats: Simple radio playout for DJs",
+		description: config.description,
+	}}
+>
+	<div class="text-foreground">
+		<section class:list={[section, "flex flex-wrap items-center gap-x-16 gap-y-12 pt-22 pb-18"]}>
+			<div class="flex min-w-0 flex-[999_1_32rem] flex-col items-start gap-6">
+				<h1
+					class="max-w-[13ch] font-display text-[clamp(2.5rem,6vw,4rem)] leading-[1.04] font-semibold tracking-[-0.045em]"
+				>
+					You pick the music. Elizabeats plays it.
+				</h1>
+				<p class="max-w-[34rem] text-[1.1875rem] leading-[1.6] text-muted-foreground">
+					{config.description}
+				</p>
+				<div class="flex flex-wrap gap-3 pt-2">
+					<Button href="/download" data-download>
+						<svg
+							aria-hidden="true"
+							width="16"
+							height="16"
+							viewBox="0 0 24 24"
+							fill="none"
+							stroke="currentColor"
+							stroke-width="2"
+							stroke-linecap="round"
+							stroke-linejoin="round"
+							><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><path
+								d="m7 10 5 5 5-5"></path><path d="M12 15V3"></path></svg
+						>
+						<span data-download-label>Download</span>
+					</Button>
+					<Button href="/download" variant="secondary">Other downloads</Button>
+				</div>
+			</div>
+			<!-- On phones the screenshot is the hero's picture; Eliza still closes the page. -->
+			<div class="hidden flex-[1_1_18.75rem] justify-center sm:flex">
+				<img
+					src="/icon.png"
+					alt="Eliza, the Elizabeats mascot, wearing headphones"
+					width="250"
+					height="250"
+					class="size-75 flex-none rounded-full border border-border bg-muted p-[1.5625rem]"
+				/>
+			</div>
+		</section>
+
+		<!-- One per theme (Blume's dark: follows the toggle and the system).
+		     Lazy, so the hidden one is never downloaded. -->
+		<section class:list={[section, "pb-24"]}>
+			<img
+				src="/images/app-light.webp"
+				alt={screenshotAlt}
+				width="2000"
+				height="1149"
+				loading="lazy"
+				class:list={[screenshot, "dark:hidden"]}
+			/>
+			<img
+				src="/images/app-dark.webp"
+				alt={screenshotAlt}
+				width="2000"
+				height="1150"
+				loading="lazy"
+				class:list={[screenshot, "hidden dark:block"]}
+			/>
+		</section>
+
+		<section class:list={[section, "flex flex-col gap-10 pb-24"]}>
+			<h2 class={heading}>Features</h2>
+			<div class="grid grid-cols-[repeat(auto-fill,minmax(min(20rem,100%),1fr))] gap-4">
+				{
+					features.map((feature) => (
+						<div class="flex flex-col gap-2.5 rounded-xl border border-border p-6">
+							<div class="mb-1.5 flex size-9 items-center justify-center rounded-blume bg-muted text-accent">
+								<svg
+									aria-hidden="true"
+									width="18"
+									height="18"
+									viewBox="0 0 24 24"
+									fill="none"
+									stroke="currentColor"
+									stroke-width="2"
+									stroke-linecap="round"
+									stroke-linejoin="round"
+								>
+									{feature.icon.map((d) => (
+										<path d={d} />
+									))}
+								</svg>
+							</div>
+							<h3 class="font-display text-[1.0625rem] font-semibold tracking-[-0.02em]">
+								{feature.title}
+							</h3>
+							<p class="text-[0.9375rem] leading-[1.6] text-muted-foreground">{feature.body}</p>
+						</div>
+					))
+				}
+			</div>
+		</section>
+
+		<section
+			class:list={[
+				section,
+				"flex flex-col items-center gap-5 border-t border-border py-24 text-center",
+			]}
+		>
+			<img src="/icon.png" alt="" width="88" height="88" />
+			<h2 class={heading}>Ready for your next show?</h2>
+			<p class="text-[1.0625rem] text-muted-foreground">Free and open source.</p>
+			<div class="flex flex-wrap justify-center gap-3 pt-2">
+				<Button href="/download" data-download>Download Elizabeats</Button>
+				<Button href="/download" variant="secondary">Other downloads</Button>
+			</div>
+		</section>
+	</div>
+</PageLayout>
+
+<script>
+	import { detectPlatform } from "../lib/downloads";
+
+	// Point the download buttons straight at the right file. Without a match
+	// (or without JavaScript) they lead to the download page instead.
+	async function updateDownloadButtons() {
+		const platform = await detectPlatform();
+		if (!platform) return;
+		for (const link of document.querySelectorAll<HTMLAnchorElement>("[data-download]")) {
+			link.href = platform.files[0].url;
+			const label = link.querySelector("[data-download-label]");
+			if (label) label.textContent = platform.button;
+		}
+	}
+
+	document.addEventListener("astro:page-load", updateDownloadButtons);
+</script>

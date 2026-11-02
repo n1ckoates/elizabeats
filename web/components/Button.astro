@@ -1,0 +1,28 @@
+---
+// A link styled as a button, in Blume's theme colors. Extra attributes (such
+// as `data-download`) and classes pass through to the <a>.
+import type { HTMLAttributes } from "astro/types";
+
+interface Props extends HTMLAttributes<"a"> {
+	variant?: "primary" | "secondary" | "ghost";
+}
+
+const { variant = "primary", class: className, ...rest } = Astro.props;
+
+const variants = {
+	primary: "px-[1.125rem] bg-accent text-accent-foreground hover:opacity-90",
+	secondary: "px-[1.125rem] border border-border text-foreground hover:bg-muted",
+	ghost: "px-2 text-foreground hover:bg-muted",
+};
+---
+
+<a
+	class:list={[
+		"inline-flex h-11 items-center gap-2 rounded-blume text-[0.9375rem] font-medium no-underline transition-[background-color,opacity]",
+		variants[variant],
+		className,
+	]}
+	{...rest}
+>
+	<slot />
+</a>
