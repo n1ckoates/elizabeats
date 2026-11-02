@@ -699,7 +699,9 @@ impl AppView {
 
         let status_id = format!("status-{}", row.id);
         let status: Option<AnyElement> = match (row.role, row.readiness) {
-            (Role::Active, _) => Some(equalizer(cx.theme().danger).into_any_element()),
+            (Role::Active, _) => {
+                Some(equalizer(self.equalizer_time(), cx.theme().danger).into_any_element())
+            }
             (Role::Incoming, _) => Some(with_tooltip(
                 status_id,
                 "Crossfading in",
@@ -933,14 +935,19 @@ fn insertion_line(color: gpui_kit::Hsla) -> Div {
         .bg(color)
 }
 
-/// The "now playing" equalizer: three bars bouncing at different speeds.
-///
-/// Bar heights come from the clock each time the row is drawn; while a Track
-/// plays the window redraws every display frame (see `AppView::render`).
-fn equalizer(color: gpui_kit::Hsla) -> impl IntoElement {
+/// Seconds on the equalizer's clock, which only ever moves forward.
+pub(super) fn equalizer_clock() -> f32 {
     static START: std::sync::LazyLock<std::time::Instant> =
         std::sync::LazyLock::new(std::time::Instant::now);
-    let t = START.elapsed().as_secs_f32();
+    START.elapsed().as_secs_f32()
+}
+
+/// The "now playing" equalizer: three bars bouncing at different speeds.
+///
+/// Bar heights come from `t` (see [`equalizer_clock`]) each time the row is
+/// drawn; while a Track plays the window redraws every display frame (see
+/// `AppView::render`).
+fn equalizer(t: f32, color: gpui_kit::Hsla) -> impl IntoElement {
     let bars = [(7.0_f32, 0.0_f32), (9.5, 1.3), (6.0, 2.6)].map(|(speed, phase)| {
         let level = (t * speed + phase).sin().abs();
         div()

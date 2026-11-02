@@ -69,7 +69,19 @@ pub struct Station {
     shutting_down: bool,
     /// When the audio engine last reported playback progress.
     progress_at: Option<std::time::Instant>,
+    /// Set while frozen for screenshots (never in stable builds).
+    #[cfg(not(elizabeats_release))]
+    frozen: Option<Frozen>,
     _event_loop: Task<()>,
+}
+
+/// While frozen, background events wait here instead of changing the
+/// Session, so the Queue, progress and countdowns hold still. Audio keeps
+/// playing; the held events catch the Session up on unfreeze.
+#[cfg(not(elizabeats_release))]
+struct Frozen {
+    held: Vec<StationEvent>,
+    extrapolation: f64,
 }
 
 /// Inputs for building a [`Station`].
@@ -141,6 +153,8 @@ impl Station {
             library_revision: 0,
             shutting_down: false,
             progress_at: None,
+            #[cfg(not(elizabeats_release))]
+            frozen: None,
             _event_loop: event_loop,
         };
         station.apply_settings_side_effects(None);
@@ -165,6 +179,10 @@ impl Station {
     /// so the UI can move progress smoothly between reports. Capped so a
     /// stalled engine never makes the display run ahead.
     pub fn progress_extrapolation(&self) -> f64 {
+        #[cfg(not(elizabeats_release))]
+        if let Some(frozen) = &self.frozen {
+            return frozen.extrapolation;
+        }
         if self.session.queue().is_stopped() {
             return 0.0;
         }
@@ -182,6 +200,45 @@ impl Station {
 
     pub fn library_revision(&self) -> u64 {
         self.library_revision
+    }
+
+    /// Freezes or unfreezes for screenshots (see [`Frozen`]). Freezing shows
+    /// the Active Track halfway through; only the display moves there, and the
+    /// engine's next report after unfreezing puts it back.
+    #[cfg(not(elizabeats_release))]
+    pub fn set_frozen(&mut self, frozen: bool, cx: &mut Context<Self>) {
+        if frozen {
+            if self.frozen.is_none() {
+                let halfway = self.session.queue().active().and_then(|active| {
+                    let duration = active.progress.duration;
+                    (active.item.as_track().is_some() && duration > 0.0)
+                        .then_some((active.load?, duration))
+                });
+                if let Some((id, duration)) = halfway {
+                    self.session.audio_event(AudioEvent::Progress {
+                        id,
+                        position_secs: duration / 2.0,
+                        duration_secs: Some(duration),
+                    });
+                    self.execute();
+                }
+                self.frozen = Some(Frozen {
+                    held: Vec::new(),
+                    extrapolation: 0.0,
+                });
+            }
+        } else if let Some(frozen) = self.frozen.take() {
+            for event in frozen.held {
+                self.handle_event(event, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Sends an event as background work would.
+    #[cfg(all(test, not(elizabeats_release)))]
+    pub fn send_event(&self, event: StationEvent) {
+        let _ = self.events.unbounded_send(event);
     }
 
     // ---- Session commands --------------------------------------------------
@@ -283,6 +340,11 @@ impl Station {
 
     fn handle_event(&mut self, event: StationEvent, cx: &mut Context<Self>) {
         if self.shutting_down {
+            return;
+        }
+        #[cfg(not(elizabeats_release))]
+        if let Some(frozen) = &mut self.frozen {
+            frozen.held.push(event);
             return;
         }
         match event {

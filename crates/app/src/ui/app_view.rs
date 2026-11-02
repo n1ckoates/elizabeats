@@ -46,6 +46,10 @@ pub struct AppView {
     /// Display slot an in-progress drag would drop into.
     pub(super) drop_slot: Option<usize>,
     pub(super) now: chrono::DateTime<Local>,
+    /// The equalizer's time while frozen for screenshots, so the header clock,
+    /// the Queue and the equalizer all hold still (dev builds only).
+    #[cfg(not(elizabeats_release))]
+    pub(super) frozen_at: Option<f32>,
     theme: elizabeats_core::Theme,
     /// The system's "Reduce motion" accessibility setting, read at launch.
     system_reduce_motion: bool,
@@ -54,6 +58,17 @@ pub struct AppView {
     close_prompt_open: bool,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// The header's time while frozen for screenshots, the same in every shot:
+/// Sun, Mar 1, 12:23:56 PM.
+#[cfg(not(elizabeats_release))]
+pub(super) fn screenshot_time() -> chrono::DateTime<Local> {
+    use chrono::TimeZone;
+    Local
+        .with_ymd_and_hms(2026, 3, 1, 12, 23, 56)
+        .earliest()
+        .unwrap_or_else(Local::now)
 }
 
 #[derive(Clone, Copy)]
@@ -142,7 +157,7 @@ impl AppView {
                     .await;
                 let now = Local::now();
                 let result = this.update(cx, |this, cx| {
-                    if now.timestamp() != this.now.timestamp() {
+                    if !this.is_frozen() && now.timestamp() != this.now.timestamp() {
                         this.now = now;
                         cx.notify();
                     }
@@ -180,6 +195,8 @@ impl AppView {
             queue_scroll: ScrollHandle::new(),
             drop_slot: None,
             now: Local::now(),
+            #[cfg(not(elizabeats_release))]
+            frozen_at: None,
             theme: elizabeats_core::Theme::System,
             system_reduce_motion: cx.reduce_motion(),
             library_revision: 0,
@@ -209,6 +226,47 @@ impl AppView {
             elizabeats_core::Theme::Light => Some(WindowAppearance::Light),
             elizabeats_core::Theme::Dark => Some(WindowAppearance::Dark),
         });
+    }
+
+    /// Whether the window is frozen for screenshots (never in stable builds).
+    pub(super) fn is_frozen(&self) -> bool {
+        #[cfg(not(elizabeats_release))]
+        return self.frozen_at.is_some();
+        #[cfg(elizabeats_release)]
+        false
+    }
+
+    /// Seconds for the equalizer: its clock, or the moment it was frozen at.
+    pub(super) fn equalizer_time(&self) -> f32 {
+        #[cfg(not(elizabeats_release))]
+        if let Some(frozen_at) = self.frozen_at {
+            return frozen_at;
+        }
+        super::queue_panel::equalizer_clock()
+    }
+
+    /// Freezes everything that moves (clock, progress, Queue, equalizer) so
+    /// light and dark screenshots match, or unfreezes and catches up.
+    #[cfg(not(elizabeats_release))]
+    fn on_toggle_screenshot_freeze(
+        &mut self,
+        _: &super::ToggleScreenshotFreeze,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let freeze = self.frozen_at.is_none();
+        self.frozen_at = freeze.then(super::queue_panel::equalizer_clock);
+        if freeze {
+            self.now = screenshot_time();
+            // Takes focus out of the search box, so its caret can't blink.
+            self.focus.focus(window, cx);
+        } else {
+            self.now = Local::now();
+        }
+        self.station
+            .update(cx, |station, cx| station.set_frozen(freeze, cx));
+        tracing::info!(frozen = freeze, "screenshot freeze");
+        cx.notify();
     }
 
     fn after_station_change(&mut self, cx: &mut Context<Self>) {
@@ -438,12 +496,14 @@ impl Render for AppView {
             .queue()
             .active()
             .is_some_and(|active| active.item.as_track().is_some());
-        if track_playing {
+        if track_playing && !self.is_frozen() {
             window.request_animation_frame();
         }
         let min_panel: Pixels = px(360.);
-        v_flex()
-            .id("elizabeats")
+        let root = v_flex();
+        #[cfg(not(elizabeats_release))]
+        let root = root.on_action(cx.listener(Self::on_toggle_screenshot_freeze));
+        root.id("elizabeats")
             .key_context(APP_CONTEXT)
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::on_quit))

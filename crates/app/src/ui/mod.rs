@@ -47,6 +47,10 @@ gpui_kit::actions!(
     ]
 );
 
+// Dev builds only: holds the window still for screenshots (see `AppView::frozen_at`).
+#[cfg(not(elizabeats_release))]
+gpui_kit::actions!(elizabeats, [ToggleScreenshotFreeze]);
+
 /// Height of the Queue and Search/Log panel headers: the height of gpui-kit's
 /// default (medium) tabs, so the tabs fill their header exactly.
 pub const PANEL_HEADER_HEIGHT: f32 = 32.;
@@ -59,7 +63,7 @@ pub const QUEUE_ROW_CONTEXT: &str = "QueueRow";
 /// without these the system shortcuts (⌘M, ⌘Q, ⌘C/⌘V…) have nothing to trigger.
 pub fn set_menus(cx: &mut App) {
     use gpui_kit::{Menu, MenuItem, OsAction};
-    cx.set_menus([
+    let menus = [
         Menu::new("Elizabeats").items([MenuItem::action("Quit Elizabeats", Quit)]),
         Menu::new("Edit").items([
             MenuItem::os_action("Undo", gpui_kit::component::input::Undo, OsAction::Undo),
@@ -78,7 +82,15 @@ pub fn set_menus(cx: &mut App) {
             MenuItem::action("Minimize", Minimize),
             MenuItem::action("Zoom", Zoom),
         ]),
-    ]);
+    ];
+    #[cfg(not(elizabeats_release))]
+    let menus = menus
+        .into_iter()
+        .chain([Menu::new("Debug").items([MenuItem::action(
+            "Freeze for screenshots",
+            ToggleScreenshotFreeze,
+        )])]);
+    cx.set_menus(menus);
 }
 
 pub fn bind_keys(cx: &mut App) {
@@ -99,6 +111,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-up", MoveSelectedUp, Some(QUEUE_ROW_CONTEXT)),
         KeyBinding::new("secondary-down", MoveSelectedDown, Some(QUEUE_ROW_CONTEXT)),
     ]);
+    #[cfg(not(elizabeats_release))]
+    cx.bind_keys([KeyBinding::new(
+        "secondary-alt-shift-s",
+        ToggleScreenshotFreeze,
+        Some(APP_CONTEXT),
+    )]);
 }
 
 /// Tabular figures so clocks and durations don't jitter.

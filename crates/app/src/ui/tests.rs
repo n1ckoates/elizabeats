@@ -68,8 +68,13 @@ fn command(view: &Entity<AppView>, cx: &mut TestAppContext, run: impl FnOnce(&mu
 
 /// A one-second silent mono WAV.
 fn write_wav(path: &Path) {
+    write_wav_seconds(path, 1);
+}
+
+/// A silent mono WAV, `seconds` long.
+fn write_wav_seconds(path: &Path, seconds: u32) {
     let rate: u32 = 8000;
-    let samples = rate;
+    let samples = rate * seconds;
     let data_len = samples * 2;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"RIFF");
@@ -947,4 +952,137 @@ async fn reduce_motion_is_only_on_while_a_dialog_is_open(cx: &mut TestAppContext
     })
     .unwrap();
     assert!(!reduced(cx), "dialog closed: back to normal");
+}
+
+/// Dev builds can freeze the window for screenshots: background events wait
+/// and the header clock stops, until unfreezing applies the held events.
+#[cfg(not(elizabeats_release))]
+#[gpui_kit::test]
+async fn screenshot_freeze_holds_events_until_unfrozen(cx: &mut TestAppContext) {
+    use crate::station::StationEvent;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (window, view) = open_app(cx, dir.path());
+    cx.run_until_parked();
+    let revision = |cx: &mut TestAppContext| {
+        view.read_with(cx, |view, cx| view.station.read(cx).library_revision())
+    };
+    let toggle = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.press("secondary-alt-shift-s", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+
+    toggle(cx);
+    let before = revision(cx);
+    let frozen_now = view.read_with(cx, |view, _| view.now);
+    assert_eq!(
+        frozen_now.format("%a, %b %-d %I:%M:%S %p").to_string(),
+        "Sun, Mar 1 12:23:56 PM",
+        "the header shows the fixed screenshot time"
+    );
+    view.read_with(cx, |view, cx| {
+        view.station
+            .read(cx)
+            .send_event(StationEvent::LibraryChanged);
+    });
+    cx.executor().advance_clock(Duration::from_secs(2));
+    cx.run_until_parked();
+    assert_eq!(revision(cx), before, "events wait while frozen");
+    assert_eq!(
+        view.read_with(cx, |view, _| view.now),
+        frozen_now,
+        "clock stopped"
+    );
+
+    toggle(cx);
+    assert!(revision(cx) > before, "held events apply on unfreeze");
+    assert_ne!(
+        view.read_with(cx, |view, _| view.now),
+        frozen_now,
+        "back to the real time"
+    );
+}
+
+/// Freezing shows the playing Track halfway through, so its elapsed time,
+/// remaining time and progress bar agree in every screenshot.
+#[cfg(not(elizabeats_release))]
+#[gpui_kit::test]
+async fn screenshot_freeze_shows_the_active_track_halfway(cx: &mut TestAppContext) {
+    // Needs a real sound output; CI machines have none (GitHub sets `CI`).
+    if std::env::var_os("CI").is_some() {
+        eprintln!("skipped: no audio output device on CI");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let library = tempfile::tempdir().unwrap();
+    write_wav_seconds(&library.path().join("A.wav"), 30);
+    elizabeats_store::save_settings(
+        dir.path(),
+        &AppSettings {
+            library_folder: Some(library.path().to_string_lossy().into_owned()),
+            ..AppSettings::default()
+        },
+    )
+    .unwrap();
+    let (window, view) = open_app(cx, dir.path());
+
+    let wait =
+        |cx: &mut TestAppContext, what: &str, done: &dyn Fn(&AppView, &gpui_kit::App) -> bool| {
+            for _ in 0..200 {
+                cx.run_until_parked();
+                if view.read_with(cx, |view, cx| done(view, cx)) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            panic!("timed out waiting for {what}");
+        };
+    wait(cx, "library scan", &|view, cx| {
+        view.search.read(cx).tracks().len() == 1
+    });
+    let track = view.read_with(cx, |view, cx| view.search.read(cx).tracks()[0].clone());
+    command(&view, cx, |session| session.add_track_to_end(track));
+    wait(cx, "track ready", &|view, cx| {
+        let session = view.station.read(cx).session();
+        session
+            .queue()
+            .items()
+            .all(|item| session.readiness(item) == Readiness::Ready)
+    });
+    let id = queue_ids(&view, cx)[0].clone();
+    command(&view, cx, |session| session.play_item(&id));
+    wait(cx, "playback progress", &|view, cx| {
+        let queue = view.station.read(cx).session().queue();
+        queue.active().is_some_and(|active| {
+            active.progress.current_time > 0.0 && active.progress.duration > 0.0
+        })
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.press("secondary-alt-shift-s", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    std::thread::sleep(Duration::from_millis(300));
+    cx.run_until_parked();
+
+    let (progress, extrapolation) = view.read_with(cx, |view, cx| {
+        let station = view.station.read(cx);
+        let active = station.session().queue().active().unwrap();
+        (active.progress, station.progress_extrapolation())
+    });
+    assert!(
+        (progress.current_time - progress.duration / 2.0).abs() < 1e-9,
+        "halfway, and held there: {progress:?}"
+    );
+    assert!(
+        extrapolation.abs() < f64::EPSILON,
+        "no drift between reports"
+    );
 }
