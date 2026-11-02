@@ -116,12 +116,23 @@ const features = [
 			</div>
 		</section>
 
+		<!-- One per theme. Lazy, so the hidden one is never downloaded. -->
 		<section class="screenshot">
 			<img
-				src="/images/app.webp"
+				class="light"
+				src="/images/app-light.webp"
 				alt="The Elizabeats window: an on-air clock across the top, the queue on the left with a track playing and two talk breaks, and YouTube Music search results on the right"
 				width="2000"
 				height="1149"
+				loading="lazy"
+			/>
+			<img
+				class="dark"
+				src="/images/app-dark.webp"
+				alt="The Elizabeats window: an on-air clock across the top, the queue on the left with a track playing and two talk breaks, and YouTube Music search results on the right"
+				width="2000"
+				height="1150"
+				loading="lazy"
 			/>
 		</section>
 
@@ -271,16 +282,25 @@ const features = [
 		border: 1px solid var(--blume-border);
 	}
 
+	/* On phones the screenshot is the hero's picture; Eliza still closes the page. */
 	@media (max-width: 40rem) {
-		.mascot img {
-			width: 12.5rem;
-			height: 12.5rem;
-			padding: 1rem;
+		.mascot {
+			display: none;
 		}
 	}
 
 	.screenshot {
 		padding-bottom: 6rem;
+	}
+
+	/* Blume sets data-theme on <html>, from the toggle or the system setting. */
+	.screenshot .dark,
+	:global([data-theme="dark"]) .screenshot .light {
+		display: none;
+	}
+
+	:global([data-theme="dark"]) .screenshot .dark {
+		display: block;
 	}
 
 	.screenshot img {
@@ -294,6 +314,18 @@ const features = [
 		box-shadow:
 			0 1px 3px rgb(0 0 0 / 0.06),
 			0 8px 24px rgb(0 0 0 / 0.06);
+	}
+
+	/* Too small to read whole on a phone, so show the clock and Queue (the
+	   left half of the window) at twice the size, fading out at the cut. */
+	@media (max-width: 40rem) {
+		.screenshot img {
+			aspect-ratio: 1000 / 1149;
+			object-fit: cover;
+			object-position: left top;
+			border-radius: 2.6% 0 0 2.6% / 2.263% 0 0 2.263%;
+			mask-image: linear-gradient(to right, black 94%, transparent);
+		}
 	}
 
 	.features {
