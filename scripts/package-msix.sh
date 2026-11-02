@@ -1,17 +1,29 @@
 #!/usr/bin/env bash
-# Packs the Microsoft Store package (unsigned; the Store signs it) at
-# target/packages/Elizabeats_<version>_x64.msix, from an already-built
-# target/release/elizabeats.exe. Windows only: uses makeappx from the
-# Windows SDK. The manifest is crates/app/windows/Package.appxmanifest.
+# Packs the Microsoft Store package (unsigned; the Store signs it) from an
+# already-built target/release/elizabeats.exe. Windows only: uses makeappx
+# from the Windows SDK. The manifest is crates/app/windows/Package.appxmanifest.
+#
+# Usage: scripts/package-msix.sh <version>
+#   1.0.2         a release: target/packages/Elizabeats-Windows.msix, package
+#                 version 1.0.2.0 (the one to submit to the Store)
+#   1.0.2-dev.57  a test build: target/packages/Elizabeats-1.0.2-dev.57-Windows.msix,
+#                 package version 1.0.2.57, which the Store refuses (it needs
+#                 the last number to be 0), so it can't be submitted by mistake
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# MSIX versions are four numbers; the Store needs the last to be 0, and every
-# submission needs a higher version than the last.
-version=$(cargo metadata --no-deps --format-version 1 |
-  jq -r '.packages[] | select(.name == "elizabeats") | .version')
-if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  echo "MSIX needs a plain X.Y.Z version in Cargo.toml, not $version" >&2
+version=$1
+if [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+  package_version="$version.0"
+  output=target/packages/Elizabeats-Windows.msix
+elif [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-dev\.([0-9]+)$ ]]; then
+  # The run number as the last of the four numbers (each at most 65535, and
+  # never 0, which would make it look like a release).
+  revision=$(( BASH_REMATCH[2] % 65536 ))
+  package_version="${BASH_REMATCH[1]}.$(( revision == 0 ? 1 : revision ))"
+  output=target/packages/Elizabeats-$version-Windows.msix
+else
+  echo "MSIX needs a version like 1.0.2 or 1.0.2-dev.57, not $version" >&2
   exit 1
 fi
 
@@ -22,9 +34,9 @@ rm -rf "$stage"
 mkdir -p "$stage" target/packages
 cp target/release/elizabeats.exe "$stage/"
 cp -r crates/app/windows/Assets "$stage/Assets"
-sed "s/Version=\"0.0.0.0\"/Version=\"$version.0\"/" \
+sed "s/Version=\"0.0.0.0\"/Version=\"$package_version\"/" \
   crates/app/windows/Package.appxmanifest > "$stage/AppxManifest.xml"
-grep -q "Version=\"$version.0\"" "$stage/AppxManifest.xml"
+grep -q "Version=\"$package_version\"" "$stage/AppxManifest.xml"
 
 # The resource index lets Windows pick the right icon variant (sizes, and the
 # unplated ones without a colored tile behind them). Without it, Windows only
@@ -35,4 +47,4 @@ MSYS_NO_PATHCONV=1 "$sdk_bin/makepri.exe" createconfig \
 MSYS_NO_PATHCONV=1 "$sdk_bin/makepri.exe" new /pr "$stage" /cf target/msix-priconfig.xml \
   /mn "$stage/AppxManifest.xml" /of "$stage/resources.pri" /o
 
-"$sdk_bin/makeappx.exe" pack -o -d "$stage" -p "target/packages/Elizabeats_${version}_x64.msix"
+"$sdk_bin/makeappx.exe" pack -o -d "$stage" -p "$output"

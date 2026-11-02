@@ -12,9 +12,8 @@
 # downloaded first so updates from it can be small deltas.
 #
 # Output: Velopack's files in target/velopack/<channel>/, and in target/dist/
-# the files a release publishes: the downloads under stable names (e.g.
-# Elizabeats-Windows-Setup.exe) plus the update packages and feed the
-# updater reads.
+# the downloads plus the update packages and feed the updater reads (what a
+# release publishes).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -93,17 +92,24 @@ vpk pack \
   --outputDir "$out" \
   ${extra[@]+"${extra[@]}"}
 
-# The downloads, under names that never change, so links to
-# releases/latest/download/<name> always get the newest version.
+# The downloads. Releases use names that never change (e.g.
+# Elizabeats-Windows-Setup.exe), so links to releases/latest/download/<name>
+# always get the newest version; test builds say which build they are
+# (e.g. Elizabeats-1.0.2-dev.57-Windows-Setup.exe).
+if [[ "$version" == *-* ]]; then
+  name=Elizabeats-$version-$platform
+else
+  name=Elizabeats-$platform
+fi
 shopt -s nullglob
 for file in "$out"/*-Setup.exe "$out"/*-Setup.pkg; do
-  cp "$file" "target/dist/Elizabeats-$platform-Setup.${file##*.}"
+  cp "$file" "target/dist/$name-Setup.${file##*.}"
 done
 for file in "$out"/*-Portable.zip; do
-  cp "$file" "target/dist/Elizabeats-$platform-Portable.zip"
+  cp "$file" "target/dist/$name-Portable.zip"
 done
 for file in "$out"/*.AppImage; do
-  cp "$file" "target/dist/Elizabeats-$platform.AppImage"
+  cp "$file" "target/dist/$name.AppImage"
 done
 # What the updater reads: this version's packages and the channel's feed.
 for file in "$out"/*-"$version"-*.nupkg "$out/releases.$channel.json"; do

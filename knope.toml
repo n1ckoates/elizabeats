@@ -13,7 +13,7 @@
 # major. Changes users don't notice (refactors, CI, docs) don't need a file.
 # Only change files may live in .changeset/: knope reads every file there.
 #
-# .github/workflows/main.yml runs on every push to main:
+# .github/workflows/ci.yml runs on every push to main:
 # - prepare-release, while the current version is already released: collects
 #   the change files into a "Release Elizabeats" pull request that bumps the
 #   version and adds a CHANGELOG.md section.
