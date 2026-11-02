@@ -8,6 +8,7 @@ use std::time::Duration;
 use elizabeats_core::queue::QueueItemRef;
 use elizabeats_core::session::{Readiness, Session};
 use elizabeats_core::{AppSettings, ItemKind, QueueItem, RecoverySnapshot, RecoveryStatus};
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
     AnyWindowHandle, AppContext, Bounds, Entity, Point, TestAppContext, WindowBounds,
@@ -212,6 +213,35 @@ async fn recovery_dialog_can_start_empty(cx: &mut TestAppContext) {
             .unwrap()
             .is_none()
     );
+}
+
+#[gpui_kit::test]
+async fn focus_search_shortcut_selects_the_existing_query(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (window, view) = open_app(cx, dir.path());
+    let input = view.read_with(cx, |view, _| view.search_input.clone());
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        input.update(cx, |input, cx| input.set_value("old query", window, cx));
+        window.press("secondary-k", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let (focused, selected, len) = cx
+        .update_window(window, |_, window, cx| {
+            let focused = window.has_focused_input(cx);
+            let input = input.read(cx);
+            (focused, input.selected_range(), input.value().len())
+        })
+        .unwrap();
+    assert!(focused, "the search box has focus");
+    assert_eq!(selected, 0..len, "the whole query is selected");
+
+    // Typing now replaces the old query.
+    cx.update_window(window, |_, window, cx| window.press("n", cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(input.read_with(cx, |input, _| input.value()), "n");
 }
 
 #[gpui_kit::test]

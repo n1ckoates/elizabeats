@@ -456,8 +456,12 @@ impl AppView {
     fn on_focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
         self.tab = 0;
         self.selection.clear();
-        self.search_input
-            .update(cx, |input, cx| input.focus(window, cx));
+        // Like the browser address bar: select what's there, so typing
+        // replaces the previous query.
+        self.search_input.update(cx, |input, cx| {
+            input.focus(window, cx);
+            input.select_all(window, cx);
+        });
         cx.notify();
     }
 
