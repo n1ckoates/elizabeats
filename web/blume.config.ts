@@ -13,6 +13,9 @@ export default defineConfig({
 		accent: "red",
 	},
 	footer: {
-		links: [{ label: "Made by Nick Oates", href: "https://nickoates.com" }],
+		links: [
+			{ label: "Made by Nick Oates", href: "https://nickoates.com" },
+			{ label: "Privacy", href: "/privacy" },
+		],
 	},
 });

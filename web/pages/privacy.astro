@@ -1,0 +1,70 @@
+---
+import PageLayout from "blume/components/layout/PageLayout.astro";
+import data from "blume:data";
+
+const { config } = data;
+---
+
+<PageLayout
+	site={{ title: config.title, description: config.description }}
+	logo={config.logo}
+	banner={config.banner}
+	analytics={config.analytics}
+	navigation={data.navigation}
+	favicon={config.favicon}
+	appleIcon={config.appleIcon}
+	fontCssVars={data.fontCssVars}
+	themeMode={config.theme.mode}
+	searchEnabled={config.search.enabled}
+	siteUrl={config.site}
+	ogEnabled={config.og.enabled}
+	structuredDataEnabled={config.structuredData}
+	page={{
+		title: "Privacy Policy",
+		description: "Elizabeats doesn't collect any personal information.",
+	}}
+>
+	<article class="prose mx-auto max-w-3xl px-6 pt-20 pb-24">
+		<h1>Privacy Policy</h1>
+		<p><em>Last updated November 3, 2026</em></p>
+
+		<p>
+			Elizabeats doesn't collect, store or share any personal information. It
+			has no accounts, analytics, tracking or crash reporting.
+		</p>
+
+		<h2>What stays on your computer</h2>
+		<p>
+			Your settings, library index, queue, play history and diagnostic logs are
+			saved only on your computer. They're never sent to us or anyone else.
+		</p>
+
+		<h2>YouTube</h2>
+		<p>
+			When you search or play YouTube tracks, Elizabeats connects directly to
+			YouTube (Google) to get search results, track details, artwork and audio.
+			As with any connection to a website, YouTube can see your IP address and
+			what you request. Elizabeats doesn't sign in to YouTube or send it any
+			personal information. Google's handling of that data is covered by the <a
+				href="https://policies.google.com/privacy">Google Privacy Policy</a
+			>.
+		</p>
+
+		<h2>Updates</h2>
+		<p>
+			Copies of Elizabeats installed from this website check GitHub for new
+			versions every few hours. GitHub can see your IP address when this
+			happens; see the <a
+				href="https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement"
+				>GitHub Privacy Statement</a
+			>. Copies from the Microsoft Store are updated by the Store instead.
+		</p>
+
+		<h2>Questions?</h2>
+		<p>
+			Open an issue at <a href="https://github.com/n1ckoates/elizabeats/issues"
+				>github.com/n1ckoates/elizabeats</a
+			>.
+		</p>
+	</article>
+</PageLayout>
