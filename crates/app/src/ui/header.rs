@@ -139,6 +139,20 @@ fn settings_button_padding(window: &Window) -> f32 {
 /// same gap after them as before them.
 const TRAFFIC_LIGHT_SPACE: f32 = TRAFFIC_LIGHT_INSET + TRAFFIC_LIGHTS_WIDTH + TRAFFIC_LIGHT_INSET;
 
+/// Left padding before the header's metrics: 24 px, matching the right side,
+/// or room for the macOS traffic lights. In fullscreen macOS moves the traffic
+/// lights into the menu bar that slides down on hover, and gpui-kit's TitleBar
+/// adds 12 px of its own, so this gives only the rest of the 24 px.
+fn header_left_padding(window: &Window) -> f32 {
+    if window.is_fullscreen() {
+        12.
+    } else if cfg!(target_os = "macos") {
+        TRAFFIC_LIGHT_SPACE
+    } else {
+        24.
+    }
+}
+
 impl AppView {
     pub(super) fn render_header(
         &mut self,
@@ -164,11 +178,7 @@ impl AppView {
         };
         TitleBar::new()
             .h(px(HEADER_HEIGHT))
-            .pl(px(if cfg!(target_os = "macos") {
-                TRAFFIC_LIGHT_SPACE
-            } else {
-                24.
-            }))
+            .pl(px(header_left_padding(window)))
             .border_color(cx.theme().border)
             .bg(cx
                 .theme()
