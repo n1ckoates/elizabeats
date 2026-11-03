@@ -2,7 +2,14 @@ import { defineConfig } from "blume";
 import { vercel } from "blume/deploy";
 
 export default defineConfig({
-	deployment: vercel(),
+	deployment: vercel({
+		imageService: true,
+		imagesConfig: {
+			sizes: [88, 176, 250, 500, 640, 828, 1080, 1200, 1920, 2000],
+			formats: ["image/avif", "image/webp"],
+			domains: [],
+		},
+	}),
 	title: "Elizabeats",
 	description:
 		"Simple radio playout for DJs. Search your local music folder and YouTube Music, queue up tracks and talk breaks, and Elizabeats plays it all while you’re on the mic.",

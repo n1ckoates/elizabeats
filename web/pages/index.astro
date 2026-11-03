@@ -1,6 +1,9 @@
 ---
+import { Image } from "astro:assets";
 import PageLayout from "blume/components/layout/PageLayout.astro";
 import data from "blume:data";
+import appDark from "../assets/app-dark.webp";
+import appLight from "../assets/app-light.webp";
 import Button from "../components/Button.astro";
 
 const { config } = data;
@@ -47,7 +50,8 @@ const features = [
 ];
 
 const section = "mx-auto max-w-[76rem] px-6";
-const heading = "font-display text-4xl leading-[1.15] font-semibold tracking-[-0.04em]";
+const heading =
+	"font-display text-4xl leading-[1.15] font-semibold tracking-[-0.04em]";
 
 const screenshotAlt =
 	"The Elizabeats window: an on-air clock across the top, the queue on the left with a track playing and two talk breaks, and YouTube Music search results on the right";
@@ -59,6 +63,10 @@ const screenshot = [
 	"block h-auto w-full [border-radius:1.3%/2.263%] shadow-[0_1px_3px_rgb(0_0_0/0.06),0_8px_24px_rgb(0_0_0/0.06)]",
 	"max-sm:aspect-[1000/1149] max-sm:object-cover max-sm:object-left-top max-sm:[border-radius:2.6%_0_0_2.6%/2.263%_0_0_2.263%] max-sm:[mask-image:linear-gradient(to_right,black_94%,transparent)]",
 ];
+
+const screenshotSizes =
+	"(max-width: 639px) calc(200vw - 96px), min(100vw - 48px, 1168px)";
+const screenshotWidths = [640, 828, 1080, 1200, 1920, 2000];
 ---
 
 <PageLayout
@@ -81,14 +89,21 @@ const screenshot = [
 	}}
 >
 	<div class="text-foreground">
-		<section class:list={[section, "flex flex-wrap items-center gap-x-16 gap-y-12 pt-22 pb-18"]}>
+		<section
+			class:list={[
+				section,
+				"flex flex-wrap items-center gap-x-16 gap-y-12 pt-22 pb-18",
+			]}
+		>
 			<div class="flex min-w-0 flex-[999_1_32rem] flex-col items-start gap-6">
 				<h1
 					class="max-w-[13ch] font-display text-[clamp(2.5rem,6vw,4rem)] leading-[1.04] font-semibold tracking-[-0.045em]"
 				>
 					You pick the music. Elizabeats plays it.
 				</h1>
-				<p class="max-w-[34rem] text-[1.1875rem] leading-[1.6] text-muted-foreground">
+				<p
+					class="max-w-[34rem] text-[1.1875rem] leading-[1.6] text-muted-foreground"
+				>
 					{config.description}
 				</p>
 				<div class="flex flex-wrap gap-3 pt-2">
@@ -111,13 +126,16 @@ const screenshot = [
 					<Button href="/download" variant="secondary">Other downloads</Button>
 				</div>
 			</div>
-			<!-- On phones the screenshot is the hero's picture; Eliza still closes the page. -->
+
 			<div class="hidden flex-[1_1_18.75rem] justify-center sm:flex">
-				<img
+				<Image
 					src="/icon.png"
-					alt="Eliza, the Elizabeats mascot, wearing headphones"
-					width="250"
-					height="250"
+					alt="The Elizabeats mascot wearing headphones"
+					width={250}
+					height={250}
+					densities={[1, 2]}
+					quality={80}
+					loading="eager"
 					class="size-75 flex-none rounded-full border border-border bg-muted p-[1.5625rem]"
 				/>
 			</div>
@@ -126,19 +144,23 @@ const screenshot = [
 		<!-- One per theme (Blume's dark: follows the toggle and the system).
 		     Lazy, so the hidden one is never downloaded. -->
 		<section class:list={[section, "pb-24"]}>
-			<img
-				src="/images/app-light.webp"
+			<Image
+				src={appLight}
 				alt={screenshotAlt}
-				width="2000"
-				height="1149"
+				width={appLight.width}
+				widths={screenshotWidths}
+				sizes={screenshotSizes}
+				quality={80}
 				loading="lazy"
 				class:list={[screenshot, "dark:hidden"]}
 			/>
-			<img
-				src="/images/app-dark.webp"
+			<Image
+				src={appDark}
 				alt={screenshotAlt}
-				width="2000"
-				height="1150"
+				width={appDark.width}
+				widths={screenshotWidths}
+				sizes={screenshotSizes}
+				quality={80}
 				loading="lazy"
 				class:list={[screenshot, "hidden dark:block"]}
 			/>
@@ -146,7 +168,9 @@ const screenshot = [
 
 		<section class:list={[section, "flex flex-col gap-10 pb-24"]}>
 			<h2 class={heading}>Features</h2>
-			<div class="grid grid-cols-[repeat(auto-fill,minmax(min(20rem,100%),1fr))] gap-4">
+			<div
+				class="grid grid-cols-[repeat(auto-fill,minmax(min(20rem,100%),1fr))] gap-4"
+			>
 				{
 					features.map((feature) => (
 						<div class="flex flex-col gap-2.5 rounded-xl border border-border p-6">
@@ -170,7 +194,9 @@ const screenshot = [
 							<h3 class="font-display text-[1.0625rem] font-semibold tracking-[-0.02em]">
 								{feature.title}
 							</h3>
-							<p class="text-[0.9375rem] leading-[1.6] text-muted-foreground">{feature.body}</p>
+							<p class="text-[0.9375rem] leading-[1.6] text-muted-foreground">
+								{feature.body}
+							</p>
 						</div>
 					))
 				}
@@ -183,9 +209,18 @@ const screenshot = [
 				"flex flex-col items-center gap-5 border-t border-border py-24 text-center",
 			]}
 		>
-			<img src="/icon.png" alt="" width="88" height="88" />
+			<Image
+				src="/icon.png"
+				alt=""
+				width={88}
+				height={88}
+				densities={[1, 2]}
+				quality={80}
+			/>
 			<h2 class={heading}>Ready for your next show?</h2>
-			<p class="text-[1.0625rem] text-muted-foreground">Free and open source.</p>
+			<p class="text-[1.0625rem] text-muted-foreground">
+				Free and open source.
+			</p>
 			<div class="flex flex-wrap justify-center gap-3 pt-2">
 				<Button href="/download" data-download>Download Elizabeats</Button>
 				<Button href="/download" variant="secondary">Other downloads</Button>
@@ -197,12 +232,12 @@ const screenshot = [
 <script>
 	import { detectPlatform } from "../lib/downloads";
 
-	// Point the download buttons straight at the right file. Without a match
-	// (or without JavaScript) they lead to the download page instead.
 	async function updateDownloadButtons() {
 		const platform = await detectPlatform();
 		if (!platform) return;
-		for (const link of document.querySelectorAll<HTMLAnchorElement>("[data-download]")) {
+		for (const link of document.querySelectorAll<HTMLAnchorElement>(
+			"[data-download]",
+		)) {
 			link.href = platform.files[0].url;
 			const label = link.querySelector("[data-download-label]");
 			if (label) label.textContent = platform.button;
